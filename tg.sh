@@ -4,11 +4,11 @@
 BOT_TOKEN='TOKEN'
 # ID чата или канала
 CHAT_ID='CHAT_ID'
-# Сообщение уведомления
-MESSAGE='Движ!'
 # Номер камеры
 camera_num=2
-# Ваш логин
+# Сообщение уведомления (если нужно)
+MESSAGE='Движение.'
+# Ваш логин в Avreg
 login="LOGIN"
 # Кодируем логин и пустой пароль в формате Base64
 auth_value=$(echo -n "${login}:" | base64)
@@ -26,7 +26,7 @@ get_image() {
 send_telegram() {
     # Получаем изображение
     get_image
-    # Отправляем текстовое сообщение
+    # Отправляем текстовое сообщение (если нужно, у меня закоменитировано - если камера одна, то по фотке и так понятно.)
     curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
     -d chat_id=$CHAT_ID \
     -d text="$MESSAGE" >> /tmp/telegram_log.txt 2>&1
