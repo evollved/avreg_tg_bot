@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Скрипт для создания tg.sh и настройки avreg
+# Версия 1.5 - Добавлена настройка отправки только медиа без текста
 
 CONFIG_FILE="/etc/avreg/scripts/telegram_config.sh"
 SCRIPT_FILE="/etc/avreg/scripts/tg.sh"
@@ -175,6 +176,40 @@ request_config() {
         
         break
     done
+    
+    echo ""
+    echo "=== Настройка отправки сообщений ==="
+    echo ""
+    
+    # Настройка отправки текстовых сообщений
+    echo "Отправлять текстовые уведомления вместе с медиа?"
+    echo "1) Да, отправлять и текст, и медиа (по умолчанию)"
+    echo "2) Нет, отправлять только медиа (фото/видео без текста)"
+    echo "3) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-3): " message_choice
+    
+    case $message_choice in
+        1)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Будут отправляться и текст, и медиа"
+            ;;
+        2)
+            SEND_TEXT="false"
+            SEND_MEDIA="true"
+            echo "✅ Будут отправляться только медиа (без текста)"
+            ;;
+        3)
+            SEND_TEXT="true"
+            SEND_MEDIA="false"
+            echo "✅ Будут отправляться только текстовые уведомления (без медиа)"
+            ;;
+        *)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Используется режим по умолчанию: текст + медиа"
+            ;;
+    esac
     
     echo ""
     echo "=== Настройка расписания ==="
@@ -457,6 +492,8 @@ request_config() {
     declare -a CAMERA_VIDEO_FPS
     declare -a CAMERA_EVENT_TYPES
     declare -a CAMERA_SCHEDULES
+    declare -a CAMERA_SEND_TEXT
+    declare -a CAMERA_SEND_MEDIA
     
     # Настройка для каждой камеры
     for ((i=1; i<=$CAMERA_COUNT; i++)); do
@@ -527,6 +564,51 @@ request_config() {
                     ;;
             esac
         done
+        
+        # Настройка отправки текста/медиа для камеры
+        echo ""
+        echo "Настройка отправки сообщений для камеры $CAMERA_NUM:"
+        echo "1) Использовать общие настройки отправки сообщений"
+        echo "2) Настроить индивидуально для этой камеры"
+        read -p "Ваш выбор (1-2): " message_override_choice
+        
+        if [ "$message_override_choice" = "1" ]; then
+            # Использовать общие настройки
+            CAMERA_SEND_TEXT[$i]="GENERAL"
+            CAMERA_SEND_MEDIA[$i]="GENERAL"
+            echo "   Используются общие настройки: Текст=$SEND_TEXT, Медиа=$SEND_MEDIA"
+        else
+            # Индивидуальные настройки
+            echo ""
+            echo "Выберите режим отправки для камеры $CAMERA_NUM:"
+            echo "1) Отправлять и текст, и медиа"
+            echo "2) Отправлять только медиа (без текста)"
+            echo "3) Отправлять только текст (без медиа)"
+            read -p "Ваш выбор (1-3): " camera_message_choice
+            
+            case $camera_message_choice in
+                1)
+                    CAMERA_SEND_TEXT[$i]="true"
+                    CAMERA_SEND_MEDIA[$i]="true"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться и текст, и медиа"
+                    ;;
+                2)
+                    CAMERA_SEND_TEXT[$i]="false"
+                    CAMERA_SEND_MEDIA[$i]="true"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться только медиа (без текста)"
+                    ;;
+                3)
+                    CAMERA_SEND_TEXT[$i]="true"
+                    CAMERA_SEND_MEDIA[$i]="false"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться только текстовые уведомления"
+                    ;;
+                *)
+                    CAMERA_SEND_TEXT[$i]="GENERAL"
+                    CAMERA_SEND_MEDIA[$i]="GENERAL"
+                    echo "⚠️ Используются общие настройки"
+                    ;;
+            esac
+        fi
         
         # Настройка расписания для камеры
         echo ""
@@ -763,9 +845,14 @@ request_config() {
 #!/bin/bash
 # Конфигурация Telegram бота для Avreg
 # Файл создан: $(date)
+# Версия: 1.5
 
 # Данные бота Telegram
 BOT_TOKEN='$BOT_TOKEN'
+
+# Настройки отправки сообщений
+SEND_TEXT='$SEND_TEXT'  # Отправлять текстовые уведомления (true/false)
+SEND_MEDIA='$SEND_MEDIA' # Отправлять медиа (фото/видео) (true/false)
 
 # Настройки расписания
 SCHEDULE_ENABLED='$SCHEDULE_ENABLED'
@@ -856,6 +943,26 @@ EOF
         fi
     done
     
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_SEND_TEXT=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_SEND_TEXT[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_SEND_TEXT[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_SEND_MEDIA=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_SEND_MEDIA[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_SEND_MEDIA[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
     cat <<EOF >> "$CONFIG_FILE"
 
 # Функция получения настроек камеры по номеру в базе
@@ -883,6 +990,33 @@ get_camera_config() {
     export CAMERA_SCHEDULE="\${CAMERA_SCHEDULES[\$camera_index]}"
     export VIDEO_DURATION="\${CAMERA_VIDEO_DURATIONS[\$camera_index]}"
     export VIDEO_FPS="\${CAMERA_VIDEO_FPS[\$camera_index]}"
+    export CAMERA_SEND_TEXT_SETTING="\${CAMERA_SEND_TEXT[\$camera_index]}"
+    export CAMERA_SEND_MEDIA_SETTING="\${CAMERA_SEND_MEDIA[\$camera_index]}"
+    
+    return 0
+}
+
+# Функция получения настроек отправки сообщений для камеры
+get_camera_message_settings() {
+    local camera_num=\$1
+    
+    # По умолчанию используем глобальные настройки
+    local send_text="\$SEND_TEXT"
+    local send_media="\$SEND_MEDIA"
+    
+    if [ -n "\$camera_num" ]; then
+        # Получаем настройки для конкретной камеры
+        get_camera_config "\$camera_num" 2>/dev/null
+        if [ -n "\$CAMERA_SEND_TEXT_SETTING" ] && [ "\$CAMERA_SEND_TEXT_SETTING" != "GENERAL" ]; then
+            send_text="\$CAMERA_SEND_TEXT_SETTING"
+        fi
+        if [ -n "\$CAMERA_SEND_MEDIA_SETTING" ] && [ "\$CAMERA_SEND_MEDIA_SETTING" != "GENERAL" ]; then
+            send_media="\$CAMERA_SEND_MEDIA_SETTING"
+        fi
+    fi
+    
+    export SHOULD_SEND_TEXT="\$send_text"
+    export SHOULD_SEND_MEDIA="\$send_media"
     
     return 0
 }
@@ -1413,6 +1547,13 @@ send_telegram_message() {
     local message="$1"
     local event_name="${2:-system}"
     
+    # Проверяем, нужно ли отправлять текст для этого события
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_TEXT" != "true" ]; then
+        log_message "debug" "Текстовое сообщение не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
+    
     # Проверяем расписание
     if ! check_schedule "$CAMERA_NUM" "$event_name" "info"; then
         log_message "debug" "Сообщение не отправлено: вне расписания" "$event_name"
@@ -1459,6 +1600,13 @@ send_telegram_message() {
 send_telegram_photo() {
     local event_name="${1:-motion}"
     
+    # Проверяем, нужно ли отправлять медиа для этого события
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_MEDIA" != "true" ]; then
+        log_message "debug" "Медиа не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
+    
     if [ ! -f "$IMAGE_FILE" ] || [ ! -s "$IMAGE_FILE" ]; then
         log_message "warning" "Файл изображения не существует или пуст" "$event_name"
         return 1
@@ -1476,10 +1624,16 @@ send_telegram_photo() {
     
     log_message "info" "Отправка фото в Telegram..." "$event_name"
     
+    # Определяем подпись к фото
+    local caption=""
+    if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+        caption="📸 Камера ${CAMERA_NUM}: Движение обнаружено ($(date '+%Y-%m-%d %H:%M:%S'))"
+    fi
+    
     local response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
         -F "chat_id=${CHAT_ID}" \
         -F "photo=@${IMAGE_FILE}" \
-        -F "caption=📸 Камера ${CAMERA_NUM}: Движение обнаружено ($(date '+%Y-%m-%d %H:%M:%S'))" \
+        -F "caption=${caption}" \
         -w "%{http_code}")
     
     local http_code=${response: -3}
@@ -1499,6 +1653,13 @@ send_telegram_photo() {
 # Функция для отправки видео в Telegram
 send_telegram_video() {
     local event_name="${1:-motion}"
+    
+    # Проверяем, нужно ли отправлять медиа для этого события
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_MEDIA" != "true" ]; then
+        log_message "debug" "Медиа не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
     
     if [ ! -f "$VIDEO_FILE" ] || [ ! -s "$VIDEO_FILE" ]; then
         log_message "warning" "Файл видео не существует или пуст" "$event_name"
@@ -1520,6 +1681,12 @@ send_telegram_video() {
     
     log_message "info" "Попытка отправки видео (размер: ${file_size} байт, расширение: $file_ext, тип: $(file -b --mime-type "$VIDEO_FILE" 2>/dev/null || echo 'unknown'))" "$event_name"
     
+    # Определяем подпись к видео
+    local caption=""
+    if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+        caption="🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))"
+    fi
+    
     local response=""
     local success=0
     
@@ -1531,7 +1698,7 @@ send_telegram_video() {
         response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
             -F "chat_id=${CHAT_ID}" \
             -F "document=@${VIDEO_FILE}" \
-            -F "caption=🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))" \
+            -F "caption=${caption}" \
             -w "%{http_code}")
     elif [[ "$file_size" -gt $VIDEO_MAX_SIZE ]]; then
         # Большие файлы отправляем как документ
@@ -1540,7 +1707,7 @@ send_telegram_video() {
         response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
             -F "chat_id=${CHAT_ID}" \
             -F "document=@${VIDEO_FILE}" \
-            -F "caption=🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))" \
+            -F "caption=${caption}" \
             -w "%{http_code}")
     elif [ "$file_ext" = "mp4" ] || file "$VIDEO_FILE" | grep -q "MP4"; then
         # MP4 файлы отправляем как видео
@@ -1549,7 +1716,7 @@ send_telegram_video() {
         response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo" \
             -F "chat_id=${CHAT_ID}" \
             -F "video=@${VIDEO_FILE}" \
-            -F "caption=🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))" \
+            -F "caption=${caption}" \
             -w "%{http_code}")
     else
         # Остальные форматы как документ
@@ -1558,7 +1725,7 @@ send_telegram_video() {
         response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
             -F "chat_id=${CHAT_ID}" \
             -F "document=@${VIDEO_FILE}" \
-            -F "caption=🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))" \
+            -F "caption=${caption}" \
             -w "%{http_code}")
     fi
     
@@ -1580,7 +1747,7 @@ send_telegram_video() {
             response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
                 -F "chat_id=${CHAT_ID}" \
                 -F "document=@${VIDEO_FILE}" \
-                -F "caption=🎥 Камера ${CAMERA_NUM}: Видео ${VIDEO_DURATION}сек ($(date '+%Y-%m-%d %H:%M:%S'))" \
+                -F "caption=${caption}" \
                 -w "%{http_code}")
             
             local http_code2=${response: -3}
@@ -1615,42 +1782,49 @@ process_motion_event() {
         return 0
     fi
     
-    # Отправляем текстовое уведомление
+    # Отправляем текстовое уведомление (если включено)
     local message="🚨 Камера ${CAMERA_NUM}: Движение обнаружено в $(date '+%H:%M:%S')"
     if ! send_telegram_message "$message" "motion"; then
         log_message "warning" "Не удалось отправить текстовое уведомление" "motion"
         # Не прерываем выполнение, пробуем отправить медиа
     fi
     
-    # Обработка в зависимости от выбранного типа медиа
-    case $MEDIA_TYPE in
-        "photo")
-            if get_image; then
-                send_telegram_photo "motion"
-            fi
-            ;;
-        
-        "video")
-            # Небольшая задержка перед захватом видео
-            sleep 1
-            if get_video; then
-                send_telegram_video "motion"
-            fi
-            ;;
-        
-        "both")
-            if get_image; then
-                send_telegram_photo "motion"
-            fi
+    # Проверяем, нужно ли отправлять медиа для этой камеры
+    get_camera_message_settings "$CAMERA_NUM"
+    
+    if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
+        # Обработка в зависимости от выбранного типа медиа
+        case $MEDIA_TYPE in
+            "photo")
+                if get_image; then
+                    send_telegram_photo "motion"
+                fi
+                ;;
             
-            # Небольшая задержка перед захватом видео
-            sleep 1
+            "video")
+                # Небольшая задержка перед захватом видео
+                sleep 1
+                if get_video; then
+                    send_telegram_video "motion"
+                fi
+                ;;
             
-            if get_video; then
-                send_telegram_video "motion"
-            fi
-            ;;
-    esac
+            "both")
+                if get_image; then
+                    send_telegram_photo "motion"
+                fi
+                
+                # Небольшая задержка перед захватом видео
+                sleep 1
+                
+                if get_video; then
+                    send_telegram_video "motion"
+                fi
+                ;;
+        esac
+    else
+        log_message "info" "Отправка медиа отключена для камеры $CAMERA_NUM" "motion"
+    fi
     
     # Очистка временных файлов
     cleanup_temp_files
@@ -1799,8 +1973,13 @@ process_system_event() {
                 message="$message (время: $dt_event)"
             fi
             
-            # Отправляем сообщение
-            send_telegram_message "$message" "$event_name"
+            # Отправляем сообщение (если включена отправка текста)
+            get_camera_message_settings "$camera_num"
+            if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+                send_telegram_message "$message" "$event_name"
+            else
+                log_message "debug" "Текстовое сообщение для события $event_name не отправлено (отключено в настройках)" "$event_name"
+            fi
             
             # Логируем событие
             log_message "$level" "Событие $event_name: $description" "$event_name"
@@ -1832,13 +2011,18 @@ process_system_event() {
                 if [ $CAMERA_COUNT -gt 0 ]; then
                     CHAT_ID="${CAMERA_CHAT_IDS[0]}"
                     if [ "$CHAT_ID" != "ВАШ_CHAT_ID_ЗДЕСЬ" ] && [ "$CHAT_ID" != "ОБЩИЙ_ЧАТ" ]; then
-                        # Для системных событий проверяем расписание
-                        if check_schedule "" "$event_name" "$level"; then
-                            if check_telegram_api; then
-                                send_telegram_message "$message" "$event_name"
+                        # Для системных событий проверяем расписание и настройки отправки
+                        get_camera_message_settings ""
+                        if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+                            if check_schedule "" "$event_name" "$level"; then
+                                if check_telegram_api; then
+                                    send_telegram_message "$message" "$event_name"
+                                fi
+                            else
+                                log_message "debug" "Системное событие не отправлено: вне расписания" "$event_name"
                             fi
                         else
-                            log_message "debug" "Системное событие не отправлено: вне расписания" "$event_name"
+                            log_message "debug" "Системное событие не отправлено: текст отключен" "$event_name"
                         fi
                     fi
                 fi
@@ -1968,6 +2152,11 @@ case "$MODE" in
         echo "  FPS видео: ${VIDEO_FPS}" >&2
         echo "  Расписание: $CAMERA_SCHEDULE" >&2
         
+        # Получаем настройки отправки для камеры
+        get_camera_message_settings "$CAMERA_NUM"
+        echo "  Отправка текста: $SHOULD_SEND_TEXT" >&2
+        echo "  Отправка медиа: $SHOULD_SEND_MEDIA" >&2
+        
         # Проверяем расписание
         if ! check_schedule "$CAMERA_NUM" "test" "info"; then
             echo "⚠️  ВНИМАНИЕ: Текущее время вне расписания!" >&2
@@ -1975,13 +2164,21 @@ case "$MODE" in
             echo "" >&2
         fi
         
-        # Тестовая отправка сообщения
-        send_telegram_message "🔧 Камера ${CAMERA_NUM}: Тестовое сообщение от системы Avreg. Если вы видите это, все работает правильно!" "test"
-        
-        if [ $? -eq 0 ]; then
-            echo "✅ Тестовое сообщение отправлено успешно!" >&2
+        # Тестовая отправка сообщения (если включена отправка текста)
+        if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+            send_telegram_message "🔧 Камера ${CAMERA_NUM}: Тестовое сообщение от системы Avreg. Если вы видите это, все работает правильно!" "test"
             
-            # Тестовая отправка медиа в зависимости от настроек
+            if [ $? -eq 0 ]; then
+                echo "✅ Тестовое сообщение отправлено успешно!" >&2
+            else
+                echo "❌ Ошибка отправки тестового сообщения" >&2
+            fi
+        else
+            echo "⚠️  Отправка текстовых сообщений отключена для этой камеры" >&2
+        fi
+        
+        # Тестовая отправка медиа (если включена отправка медиа)
+        if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
             case $MEDIA_TYPE in
                 "photo")
                     echo "Отправка тестового фото..." >&2
@@ -2020,12 +2217,12 @@ case "$MODE" in
                     fi
                     ;;
             esac
-            
-            echo "Проверьте чат Telegram" >&2
         else
-            echo "❌ Ошибка отправки тестового сообщения" >&2
-            echo "Смотрите подробности в логе: $LOG_FILE" >&2
+            echo "⚠️  Отправка медиа отключена для этой камеры" >&2
         fi
+        
+        echo "Проверьте чат Telegram" >&2
+        echo "Смотрите подробности в логе: $LOG_FILE" >&2
         
         # Очистка
         cleanup_temp_files
@@ -2068,7 +2265,7 @@ create_config_editor() {
 #!/bin/bash
 
 # Скрипт для редактирования конфигурации Telegram уведомлений Avreg
-# Версия 1.4
+# Версия 1.5 - Добавлена настройка отправки только медиа без текста
 
 CONFIG_FILE="/etc/avreg/scripts/telegram_config.sh"
 TEMP_CONFIG="/tmp/telegram_config_edit.sh"
@@ -2080,6 +2277,196 @@ create_backup() {
     local backup_file="$BACKUP_DIR/telegram_config_$(date +%Y%m%d_%H%M%S).sh"
     cp "$CONFIG_FILE" "$backup_file"
     echo "✅ Создана резервная копия: $backup_file"
+}
+
+# Функция для редактирования общих настроек отправки сообщений
+edit_message_settings() {
+    echo ""
+    echo "=== Редактирование общих настроек отправки сообщений ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие настройки:"
+    echo "  Отправлять текст: $SEND_TEXT"
+    echo "  Отправлять медиа: $SEND_MEDIA"
+    echo ""
+    
+    echo "Выберите режим отправки:"
+    echo "1) Отправлять и текст, и медиа"
+    echo "2) Отправлять только медиа (без текста)"
+    echo "3) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-3): " message_choice
+    
+    case $message_choice in
+        1)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Настройки обновлены: будут отправляться и текст, и медиа"
+            ;;
+        2)
+            SEND_TEXT="false"
+            SEND_MEDIA="true"
+            echo "✅ Настройки обновлены: будут отправляться только медиа (без текста)"
+            ;;
+        3)
+            SEND_TEXT="true"
+            SEND_MEDIA="false"
+            echo "✅ Настройки обновлены: будут отправляться только текстовые уведомления"
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    # Обновляем конфигурацию
+    sed -i "s/^SEND_TEXT='.*'/SEND_TEXT='$SEND_TEXT'/" "$CONFIG_FILE"
+    sed -i "s/^SEND_MEDIA='.*'/SEND_MEDIA='$SEND_MEDIA'/" "$CONFIG_FILE"
+}
+
+# Функция для редактирования настроек отправки для конкретной камеры
+edit_camera_message_settings() {
+    echo ""
+    echo "=== Редактирование настроек отправки для камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Текст=$send_text_display, Медиа=$send_media_display"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    
+    echo ""
+    echo "Редактирование настроек отправки для камеры $camera_num"
+    echo ""
+    echo "Выберите режим отправки для этой камеры:"
+    echo "1) Использовать общие настройки"
+    echo "2) Отправлять и текст, и медиа"
+    echo "3) Отправлять только медиа (без текста)"
+    echo "4) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-4): " camera_message_choice
+    
+    case $camera_message_choice in
+        1)
+            NEW_SEND_TEXT="GENERAL"
+            NEW_SEND_MEDIA="GENERAL"
+            ;;
+        2)
+            NEW_SEND_TEXT="true"
+            NEW_SEND_MEDIA="true"
+            ;;
+        3)
+            NEW_SEND_TEXT="false"
+            NEW_SEND_MEDIA="true"
+            ;;
+        4)
+            NEW_SEND_TEXT="true"
+            NEW_SEND_MEDIA="false"
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    # Обновляем массивы
+    # Обновляем SEND_TEXT
+    awk -v idx="$array_index" -v new_val="$NEW_SEND_TEXT" '
+    /^declare -a CAMERA_SEND_TEXT=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_val "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+            print "  \"" new_val "\")"
+        } else {
+            print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    # Обновляем SEND_MEDIA
+    awk -v idx="$array_index" -v new_val="$NEW_SEND_MEDIA" '
+    /^declare -a CAMERA_SEND_MEDIA=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_val "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+            print "  \"" new_val "\")"
+        } else {
+            print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Настройки отправки для камеры $camera_num обновлены"
 }
 
 # Функция для редактирования токена бота
@@ -2872,6 +3259,11 @@ view_config() {
     echo "  Логин: $login"
     
     echo ""
+    echo "Настройки отправки сообщений:"
+    echo "  Отправлять текст: $SEND_TEXT"
+    echo "  Отправлять медиа: $SEND_MEDIA"
+    
+    echo ""
     echo "Настройки расписания:"
     echo "  Включено: $SCHEDULE_ENABLED"
     echo "  Тип: $SCHEDULE_TYPE"
@@ -2895,6 +3287,16 @@ view_config() {
     
     echo "Настройки камер:"
     for ((i=0; i<CAMERA_COUNT; i++)); do
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
         echo "  Камера ${CAMERA_NUMS[$i]}:"
         echo "    Чат ID: ${CAMERA_CHAT_IDS[$i]}"
         echo "    Тип медиа: ${CAMERA_MEDIA_TYPES[$i]}"
@@ -2902,6 +3304,8 @@ view_config() {
         echo "    Расписание: ${CAMERA_SCHEDULES[$i]}"
         echo "    Длительность видео: ${CAMERA_VIDEO_DURATIONS[$i]}сек"
         echo "    FPS видео: ${CAMERA_VIDEO_FPS[$i]}"
+        echo "    Отправка текста: $send_text_display"
+        echo "    Отправка медиа: $send_media_display"
         echo ""
     done
 }
@@ -2944,20 +3348,22 @@ show_menu() {
         echo ""
         echo "=== Редактор конфигурации Telegram уведомлений ==="
         echo "1) Просмотреть текущую конфигурацию"
-        echo "2) Редактировать токен бота"
-        echo "3) Редактировать чат для камеры"
-        echo "4) Редактировать тип медиа для камеры"
-        echo "5) Редактировать настройки событий (общие)"
-        echo "6) Редактировать события для камеры (индивидуальные)"
-        echo "7) Редактировать настройки расписания (общие)"
-        echo "8) Редактировать расписание для камеры (индивидуальные)"
-        echo "9) Редактировать параметры видео (длительность, FPS)"
-        echo "10) Протестировать конфигурацию"
-        echo "11) Создать резервную копию конфигурации"
-        echo "12) Выйти"
+        echo "2) Редактировать общие настройки отправки сообщений (текст/медиа)"
+        echo "3) Редактировать настройки отправки для конкретной камеры"
+        echo "4) Редактировать токен бота"
+        echo "5) Редактировать чат для камеры"
+        echo "6) Редактировать тип медиа для камеры"
+        echo "7) Редактировать настройки событий (общие)"
+        echo "8) Редактировать события для камеры (индивидуальные)"
+        echo "9) Редактировать настройки расписания (общие)"
+        echo "10) Редактировать расписание для камеры (индивидуальные)"
+        echo "11) Редактировать параметры видео (длительность, FPS)"
+        echo "12) Протестировать конфигурацию"
+        echo "13) Создать резервную копию конфигурации"
+        echo "14) Выйти"
         echo ""
         
-        read -p "Выберите действие (1-12): " choice
+        read -p "Выберите действие (1-14): " choice
         
         case $choice in
             1)
@@ -2965,43 +3371,51 @@ show_menu() {
                 ;;
             2)
                 create_backup
-                edit_bot_token
+                edit_message_settings
                 ;;
             3)
                 create_backup
-                edit_camera_chat
+                edit_camera_message_settings
                 ;;
             4)
                 create_backup
-                edit_camera_media_type
+                edit_bot_token
                 ;;
             5)
                 create_backup
-                edit_events
+                edit_camera_chat
                 ;;
             6)
                 create_backup
-                edit_camera_events
+                edit_camera_media_type
                 ;;
             7)
                 create_backup
-                edit_schedule
+                edit_events
                 ;;
             8)
                 create_backup
-                edit_camera_schedule
+                edit_camera_events
                 ;;
             9)
                 create_backup
-                edit_video_params
+                edit_schedule
                 ;;
             10)
-                test_config
+                create_backup
+                edit_camera_schedule
                 ;;
             11)
                 create_backup
+                edit_video_params
                 ;;
             12)
+                test_config
+                ;;
+            13)
+                create_backup
+                ;;
+            14)
                 echo "Выход"
                 exit 0
                 ;;
@@ -3147,7 +3561,11 @@ test_configuration() {
         return 1
     fi
     
-    echo "2. Проверка настроек расписания..."
+    echo "2. Проверка настроек отправки сообщений..."
+    echo "   Отправлять текст: $SEND_TEXT"
+    echo "   Отправлять медиа: $SEND_MEDIA"
+    
+    echo "3. Проверка настроек расписания..."
     echo "   Включено: $SCHEDULE_ENABLED"
     echo "   Тип: $SCHEDULE_TYPE"
     echo "   Дни: $SCHEDULE_DAYS"
@@ -3155,24 +3573,34 @@ test_configuration() {
     echo "   Минуты: $SCHEDULE_MINUTES"
     echo "   Отправлять критические ошибки всегда: $SEND_CRITICAL_ALWAYS"
     
-    echo "3. Проверка настроек событий..."
+    echo "4. Проверка настроек событий..."
     echo "   Типы событий: ${EVENT_TYPES[@]}"
     echo "   Уровень логирования: $LOG_LEVEL"
     
-    echo "4. Проверка камер в конфигурации..."
+    echo "5. Проверка камер в конфигурации..."
     echo "   Настроено камер: $CAMERA_COUNT"
     for ((i=0; i<CAMERA_COUNT; i++)); do
-        echo "   Камера ${CAMERA_NUMS[$i]}: Чат ${CAMERA_CHAT_IDS[$i]}, Тип: ${CAMERA_MEDIA_TYPES[$i]}, События: ${CAMERA_EVENT_TYPES[$i]}, Расписание: ${CAMERA_SCHEDULES[$i]}"
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
+        echo "   Камера ${CAMERA_NUMS[$i]}: Чат ${CAMERA_CHAT_IDS[$i]}, Тип: ${CAMERA_MEDIA_TYPES[$i]}, События: ${CAMERA_EVENT_TYPES[$i]}, Расписание: ${CAMERA_SCHEDULES[$i]}, Текст=$send_text_display, Медиа=$send_media_display"
     done
     
-    echo "5. Проверка доступности Avreg..."
+    echo "6. Проверка доступности Avreg..."
     if timeout 5 curl -s "http://${AVREG_URL}:874" > /dev/null; then
         echo "   ✅ Avreg доступен"
     else
         echo "   ⚠️  Avreg недоступен по адресу: ${AVREG_URL}:874"
     fi
     
-    echo "6. Тестирование камер..."
+    echo "7. Тестирование камер..."
     for ((i=0; i<CAMERA_COUNT; i++)); do
         camera_num=${CAMERA_NUMS[$i]}
         chat_id=${CAMERA_CHAT_IDS[$i]}
@@ -3187,14 +3615,14 @@ test_configuration() {
         fi
     done
     
-    echo "7. Тестирование расписания..."
+    echo "8. Тестирование расписания..."
     echo ""
     echo "   Для проверки расписания выполните:"
     echo "   sudo -u avreg /etc/avreg/scripts/tg.sh schedule"
     echo "   или для конкретной камеры:"
     echo "   sudo -u avreg /etc/avreg/scripts/tg.sh schedule <номер_камеры>"
     
-    echo "8. Тестирование событий..."
+    echo "9. Тестирование событий..."
     echo ""
     echo "   Примеры тестовых событий:"
     echo "   - Движение обнаружено:"
@@ -3376,6 +3804,10 @@ show_menu() {
                     source "$CONFIG_FILE" 2>/dev/null
                     echo "Бот: $(echo ${BOT_TOKEN:0:10})..."
                     echo ""
+                    echo "Настройки отправки сообщений:"
+                    echo "  Отправлять текст: $SEND_TEXT"
+                    echo "  Отправлять медиа: $SEND_MEDIA"
+                    echo ""
                     echo "Настройки расписания:"
                     echo "  Включено: $SCHEDULE_ENABLED"
                     echo "  Тип: $SCHEDULE_TYPE"
@@ -3400,6 +3832,16 @@ show_menu() {
                     echo ""
                     echo "Настройки камер:"
                     for ((i=0; i<CAMERA_COUNT; i++)); do
+                        local send_text_display="общие"
+                        local send_media_display="общие"
+                        
+                        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+                            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+                        fi
+                        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+                            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+                        fi
+                        
                         echo "  Камера ${CAMERA_NUMS[$i]}:"
                         echo "    Чат: ${CAMERA_CHAT_IDS[$i]}"
                         echo "    Тип медиа: ${CAMERA_MEDIA_TYPES[$i]}"
@@ -3407,6 +3849,8 @@ show_menu() {
                         echo "    Расписание: ${CAMERA_SCHEDULES[$i]}"
                         echo "    Длительность видео: ${CAMERA_VIDEO_DURATIONS[$i]}сек"
                         echo "    FPS видео: ${CAMERA_VIDEO_FPS[$i]}"
+                        echo "    Отправка текста: $send_text_display"
+                        echo "    Отправка медиа: $send_media_display"
                     done
                     echo ""
                     echo "Файлы:"
@@ -3428,6 +3872,8 @@ show_menu() {
                     echo "Токен бота: $(echo ${BOT_TOKEN:0:10}...)"
                     echo "Типы событий: ${EVENT_TYPES[@]}"
                     echo "Уровень логирования: $LOG_LEVEL"
+                    echo "Отправка текста: $SEND_TEXT"
+                    echo "Отправка медиа: $SEND_MEDIA"
                     echo "Настройки расписания: $SCHEDULE_ENABLED, $SCHEDULE_TYPE"
                     echo "Количество камер: $CAMERA_COUNT"
                     echo "Пользователь скриптов: $AVREG_USER"
@@ -3527,8 +3973,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=== Установка Telegram уведомлений для Avreg ==="
-echo "Версия 1.4"
-echo "Поддержка расписания работы бота"
+echo "Версия 1.5"
+echo "Поддержка расписания работы бота и гибкой настройки отправки текста/медиа"
 echo ""
 
 # Проверка ffmpeg при запуске
