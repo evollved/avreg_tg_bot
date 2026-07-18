@@ -1,0 +1,4310 @@
+#!/bin/bash
+
+# Скрипт для создания tg.sh и настройки avreg
+# Версия 1.7 - Добавлена поддержка MTProto и Socks5 прокси
+#              + Отправка уже сохраненных файлов из архива Avreg
+
+CONFIG_FILE="/etc/avreg/scripts/telegram_config.sh"
+SCRIPT_FILE="/etc/avreg/scripts/tg.sh"
+CONFIG_EDITOR="/etc/avreg/scripts/edit_telegram_config.sh"
+EVENT_COLLECTOR="/etc/avreg/scripts/event-collector"
+EVENT_COLLECTOR_SOURCE="/usr/share/doc/avreg/examples/event-collector.gz"
+EVENT_COLLECTOR_SOURCE_ALT="/usr/share/doc/avregd/examples/event-collector.gz"
+VIDEO_MAX_SIZE_MB=45
+VIDEO_MAX_SIZE=$((VIDEO_MAX_SIZE_MB * 1024 * 1024))
+AVREG_USER="avreg"
+AVREG_GROUP="avreg"
+
+# ==================== ФУНКЦИИ ПРОКСИ ====================
+
+# Функция проверки и установки необходимых пакетов для прокси
+check_and_install_proxy_tools() {
+    local need_install=0
+    
+    if command -v curl &> /dev/null; then
+        if curl --version | grep -q "socks"; then
+            echo "✅ curl установлен с поддержкой SOCKS5"
+        else
+            echo "⚠️  curl установлен без поддержки SOCKS5"
+            need_install=1
+        fi
+    else
+        echo "⚠️  curl не установлен"
+        need_install=1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        echo "⚠️  jq не установлен (необходим для MTProto)"
+        need_install=1
+    else
+        echo "✅ jq установлен"
+    fi
+    
+    if [ $need_install -eq 1 ]; then
+        echo ""
+        echo "Для работы через прокси необходимы дополнительные пакеты."
+        read -p "Установить необходимые пакеты? (y/n): " install_proxy_tools
+        
+        if [[ $install_proxy_tools =~ ^[Yy]$ ]]; then
+            echo "Попытка установки пакетов..."
+            
+            if command -v apt-get &> /dev/null; then
+                sudo apt-get update
+                sudo apt-get install -y curl jq
+            elif command -v yum &> /dev/null; then
+                sudo yum install -y curl jq
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y curl jq
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -Sy curl jq --noconfirm
+            else
+                echo "❌ Не удалось определить пакетный менеджер"
+                echo "Установите curl и jq вручную"
+                return 1
+            fi
+            
+            if command -v curl &> /dev/null && command -v jq &> /dev/null; then
+                echo "✅ Необходимые пакеты успешно установлены"
+                return 0
+            else
+                echo "❌ Не удалось установить все пакеты"
+                return 1
+            fi
+        else
+            echo "⚠️  Работа через прокси может быть ограничена"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Функция настройки прокси
+configure_proxy() {
+    echo ""
+    echo "=== Настройка прокси для Telegram ==="
+    echo "Выберите тип прокси:"
+    echo "1) Без прокси (прямое соединение)"
+    echo "2) SOCKS5 прокси"
+    echo "3) MTProto прокси (Telegram)"
+    echo "4) HTTP/HTTPS прокси"
+    read -p "Ваш выбор (1-4): " proxy_type
+    
+    PROXY_TYPE="none"
+    PROXY_HOST=""
+    PROXY_PORT=""
+    PROXY_USER=""
+    PROXY_PASS=""
+    PROXY_MT_PROTO=""
+    PROXY_MT_SECRET=""
+    
+    case $proxy_type in
+        2)
+            PROXY_TYPE="socks5"
+            echo ""
+            echo "=== Настройка SOCKS5 прокси ==="
+            read -p "Введите хост прокси (например: 127.0.0.1): " PROXY_HOST
+            read -p "Введите порт прокси (например: 1080): " PROXY_PORT
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        3)
+            PROXY_TYPE="mtproto"
+            echo ""
+            echo "=== Настройка MTProto прокси ==="
+            echo "Этот тип прокси используется в Telegram для обхода блокировок."
+            echo ""
+            read -p "Введите хост MTProto прокси (например: 127.0.0.1): " PROXY_HOST
+            read -p "Введите порт MTProto прокси (например: 443): " PROXY_PORT
+            read -p "Введите секрет для MTProto (если есть, иначе оставьте пустым): " PROXY_MT_SECRET
+            if [ -n "$PROXY_MT_SECRET" ]; then
+                PROXY_MT_PROTO="true"
+            else
+                PROXY_MT_PROTO="false"
+            fi
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        4)
+            PROXY_TYPE="http"
+            echo ""
+            echo "=== Настройка HTTP/HTTPS прокси ==="
+            read -p "Введите хост прокси (например: 127.0.0.1): " PROXY_HOST
+            read -p "Введите порт прокси (например: 8080): " PROXY_PORT
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        *)
+            PROXY_TYPE="none"
+            echo "✅ Используется прямое соединение"
+            ;;
+    esac
+    
+    if [ "$PROXY_TYPE" != "none" ] && [ -n "$PROXY_HOST" ] && [ -n "$PROXY_PORT" ]; then
+        echo "✅ Настройки прокси сохранены: $PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"
+        return 0
+    elif [ "$PROXY_TYPE" != "none" ]; then
+        echo "⚠️  Не все параметры прокси указаны, используется прямое соединение"
+        PROXY_TYPE="none"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Функция проверки доступа бота через прокси
+check_bot_access_via_proxy() {
+    local BOT_TOKEN="$1"
+    local CHAT_ID="$2"
+    
+    echo "Проверка доступа бота через прокси..."
+    
+    local curl_cmd="curl -s"
+    
+    case $PROXY_TYPE in
+        "socks5")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT --socks5-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        "http")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT --proxy-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        "mtproto")
+            echo "⚠️  MTProto прокси требует дополнительной настройки на уровне Telegram клиента"
+            curl_cmd="curl -s"
+            ;;
+        *)
+            ;;
+    esac
+    
+    local bot_info=$($curl_cmd "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+    if echo "$bot_info" | grep -q '"ok":true'; then
+        local bot_name=$(echo "$bot_info" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
+        echo "✅ Бот @${bot_name} доступен"
+    else
+        echo "❌ Ошибка: Неверный токен бота или бот не существует"
+        echo "Ответ от Telegram: $bot_info"
+        return 1
+    fi
+    
+    if [ -n "$CHAT_ID" ] && [ "$CHAT_ID" != "ВАШ_CHAT_ID_ЗДЕСЬ" ]; then
+        local chat_info=$($curl_cmd "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${CHAT_ID}")
+        if echo "$chat_info" | grep -q '"ok":true'; then
+            local chat_title=$(echo "$chat_info" | grep -o '"title":"[^"]*"' | cut -d'"' -f4)
+            local chat_type=$(echo "$chat_info" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            echo "✅ Доступ к чату получен: ${chat_title} (${chat_type})"
+            return 0
+        else
+            echo "⚠️  Не удалось получить информацию о чате. Убедитесь что:"
+            echo "   1. Бот добавлен в чат/канал"
+            echo "   2. Для каналов: бот должен быть администратором"
+            echo "   3. ID чата указан верно"
+            echo "   4. Для личных сообщений: сначала напишите боту /start"
+            echo "Ответ от Telegram: $chat_info"
+            
+            read -p "Отправить тестовое сообщение в чат? (y/n): " send_test
+            if [[ $send_test =~ ^[Yy]$ ]]; then
+                local test_result=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${CHAT_ID}" \
+                    -d "text=✅ Тестовое сообщение от бота. Если вы видите это, все настроено правильно!")
+                
+                if echo "$test_result" | grep -q '"ok":true'; then
+                    echo "✅ Тестовое сообщение отправлено успешно!"
+                    return 0
+                else
+                    echo "❌ Ошибка отправки тестового сообщения: $test_result"
+                    return 1
+                fi
+            fi
+            return 1
+        fi
+    else
+        echo "⚠️  CHAT_ID не указан"
+        return 1
+    fi
+}
+
+# Функция получения ID чата через бота с поддержкой прокси
+get_chat_id_via_bot_with_proxy() {
+    local BOT_TOKEN="$1"
+    
+    local curl_cmd="curl -s"
+    
+    case $PROXY_TYPE in
+        "socks5")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT --socks5-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        "http")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT --proxy-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        *)
+            ;;
+    esac
+    
+    echo ""
+    echo "Для получения ID чата:"
+    echo "1. Добавьте бота в нужный чат/канал"
+    echo "2. Для каналов: сделайте бота администратором"
+    echo "3. Отправьте любое сообщение в чат"
+    echo "4. ИЛИ для каналов: перешлите сообщение из канала боту"
+    echo ""
+    echo "Затем выполните:"
+    echo "$curl_cmd https://api.telegram.org/bot${BOT_TOKEN}/getUpdates"
+    echo ""
+    echo "В выводе найдите 'chat':{'id':XXXXX}"
+    echo ""
+    
+    read -p "Введите ID чата вручную или оставьте пустым для пропуска: " manual_chat_id
+    echo "$manual_chat_id"
+}
+
+# Функция проверки доступа бота (оригинальная, для обратной совместимости)
+check_bot_access() {
+    local BOT_TOKEN="$1"
+    local CHAT_ID="$2"
+    
+    if [ "$PROXY_TYPE" != "none" ] && [ -n "$PROXY_HOST" ] && [ -n "$PROXY_PORT" ]; then
+        check_bot_access_via_proxy "$BOT_TOKEN" "$CHAT_ID"
+        return $?
+    fi
+    
+    echo "Проверка доступа бота..."
+    
+    local bot_info=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+    if echo "$bot_info" | grep -q '"ok":true'; then
+        local bot_name=$(echo "$bot_info" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
+        echo "✅ Бот @${bot_name} доступен"
+    else
+        echo "❌ Ошибка: Неверный токен бота или бот не существует"
+        echo "Ответ от Telegram: $bot_info"
+        return 1
+    fi
+    
+    if [ -n "$CHAT_ID" ] && [ "$CHAT_ID" != "ВАШ_CHAT_ID_ЗДЕСЬ" ]; then
+        local chat_info=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${CHAT_ID}")
+        if echo "$chat_info" | grep -q '"ok":true'; then
+            local chat_title=$(echo "$chat_info" | grep -o '"title":"[^"]*"' | cut -d'"' -f4)
+            local chat_type=$(echo "$chat_info" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            echo "✅ Доступ к чату получен: ${chat_title} (${chat_type})"
+            return 0
+        else
+            echo "⚠️  Не удалось получить информацию о чате. Убедитесь что:"
+            echo "   1. Бот добавлен в чат/канал"
+            echo "   2. Для каналов: бот должен быть администратором"
+            echo "   3. ID чата указан верно"
+            echo "   4. Для личных сообщений: сначала напишите боту /start"
+            echo "Ответ от Telegram: $chat_info"
+            
+            read -p "Отправить тестовое сообщение в чат? (y/n): " send_test
+            if [[ $send_test =~ ^[Yy]$ ]]; then
+                local test_result=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${CHAT_ID}" \
+                    -d "text=✅ Тестовое сообщение от бота. Если вы видите это, все настроено правильно!")
+                
+                if echo "$test_result" | grep -q '"ok":true'; then
+                    echo "✅ Тестовое сообщение отправлено успешно!"
+                    return 0
+                else
+                    echo "❌ Ошибка отправки тестового сообщения: $test_result"
+                    return 1
+                fi
+            fi
+            return 1
+        fi
+    else
+        echo "⚠️  CHAT_ID не указан"
+        return 1
+    fi
+}
+
+# Функция получения ID чата через бота (оригинальная)
+get_chat_id_via_bot() {
+    local BOT_TOKEN="$1"
+    
+    if [ "$PROXY_TYPE" != "none" ] && [ -n "$PROXY_HOST" ] && [ -n "$PROXY_PORT" ]; then
+        get_chat_id_via_bot_with_proxy "$BOT_TOKEN"
+        return $?
+    fi
+    
+    echo ""
+    echo "Для получения ID чата:"
+    echo "1. Добавьте бота в нужный чат/канал"
+    echo "2. Для каналов: сделайте бота администратором"
+    echo "3. Отправьте любое сообщение в чат"
+    echo "4. ИЛИ для каналов: перешлите сообщение из канала боту"
+    echo ""
+    echo "Затем выполните:"
+    echo "curl -s https://api.telegram.org/bot${BOT_TOKEN}/getUpdates"
+    echo ""
+    echo "В выводе найдите 'chat':{'id':XXXXX}"
+    echo ""
+    
+    read -p "Введите ID чата вручную или оставьте пустым для пропуска: " manual_chat_id
+    echo "$manual_chat_id"
+}
+
+# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
+
+# Функция проверки и установки ffmpeg
+check_and_install_ffmpeg() {
+    if ! command -v ffmpeg &> /dev/null; then
+        echo ""
+        echo "⚠️  ffmpeg не установлен. Он рекомендуется для правильной работы с видео."
+        echo "   Без ffmpeg видео будет отправляться как документ в формате MJPG."
+        echo ""
+        
+        read -p "Установить ffmpeg сейчас? (y/n): " install_choice
+        if [[ $install_choice =~ ^[Yy]$ ]]; then
+            echo "Попытка установки ffmpeg..."
+            
+            if command -v apt-get &> /dev/null; then
+                echo "Обнаружен Debian/Ubuntu, использую apt-get..."
+                sudo apt-get update
+                sudo apt-get install -y ffmpeg
+            elif command -v yum &> /dev/null; then
+                echo "Обнаружен CentOS/RHEL, использую yum..."
+                sudo yum install -y ffmpeg ffmpeg-devel
+            elif command -v dnf &> /dev/null; then
+                echo "Обнаружен Fedora, использую dnf..."
+                sudo dnf install -y ffmpeg
+            elif command -v pacman &> /dev/null; then
+                echo "Обнаружен Arch Linux, использую pacman..."
+                sudo pacman -Sy ffmpeg --noconfirm
+            elif command -v zypper &> /dev/null; then
+                echo "Обнаружен openSUSE, использую zypper..."
+                sudo zypper install -y ffmpeg
+            else
+                echo "❌ Не удалось определить пакетный менеджер"
+                echo "Установите ffmpeg вручную:"
+                echo "  Debian/Ubuntu: sudo apt-get install ffmpeg"
+                echo "  CentOS/RHEL: sudo yum install ffmpeg"
+                echo "  Arch: sudo pacman -S ffmpeg"
+                return 1
+            fi
+            
+            if command -v ffmpeg &> /dev/null; then
+                echo "✅ ffmpeg успешно установлен"
+                return 0
+            else
+                echo "❌ Не удалось установить ffmpeg"
+                echo "Установите ffmpeg вручную позже"
+                return 1
+            fi
+        else
+            echo "⚠️  ffmpeg не будет установлен. Видео будет отправляться как документ."
+            return 1
+        fi
+    else
+        echo "✅ ffmpeg уже установлен"
+        return 0
+    fi
+}
+
+# Функция запроса данных для конфигурации (модифицированная)
+request_config() {
+    echo "=== Настройка Telegram уведомлений для Avreg ==="
+    echo ""
+    
+    check_and_install_proxy_tools
+    configure_proxy
+    
+    while true; do
+        echo "Введите токен вашего бота в Telegram:"
+        echo "(например: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz)"
+        read BOT_TOKEN
+        
+        if [ -z "$BOT_TOKEN" ]; then
+            echo "Токен не может быть пустым"
+            continue
+        fi
+        
+        if [[ ! "$BOT_TOKEN" =~ ^[0-9]{8,10}:[a-zA-Z0-9_-]{35}$ ]]; then
+            echo "⚠️  Формат токена выглядит нестандартно. Продолжить? (y/n): "
+            read confirm
+            if [[ ! $confirm =~ ^[Yy]$ ]]; then
+                continue
+            fi
+        fi
+        
+        break
+    done
+    
+    echo ""
+    echo "=== Настройка отправки сообщений ==="
+    echo ""
+    
+    echo "Отправлять текстовые уведомления вместе с медиа?"
+    echo "1) Да, отправлять и текст, и медиа (по умолчанию)"
+    echo "2) Нет, отправлять только медиа (фото/видео без текста)"
+    echo "3) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-3): " message_choice
+    
+    case $message_choice in
+        1)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Будут отправляться и текст, и медиа"
+            ;;
+        2)
+            SEND_TEXT="false"
+            SEND_MEDIA="true"
+            echo "✅ Будут отправляться только медиа (без текста)"
+            ;;
+        3)
+            SEND_TEXT="true"
+            SEND_MEDIA="false"
+            echo "✅ Будут отправляться только текстовые уведомления (без медиа)"
+            ;;
+        *)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Используется режим по умолчанию: текст + медиа"
+            ;;
+    esac
+    
+    echo ""
+    echo "=== Настройка расписания ==="
+    echo ""
+    
+    echo "Настроить расписание работы бота?"
+    echo "1) Всегда отправлять уведомления (по умолчанию)"
+    echo "2) Настроить дни и время работы"
+    read -p "Ваш выбор (1-2): " schedule_choice
+    
+    SCHEDULE_ENABLED="true"
+    SCHEDULE_TYPE="always"
+    SCHEDULE_DAYS=""
+    SCHEDULE_HOURS=""
+    SCHEDULE_MINUTES=""
+    
+    if [ "$schedule_choice" = "2" ]; then
+        SCHEDULE_TYPE="custom"
+        SCHEDULE_ENABLED="true"
+        
+        echo ""
+        echo "=== Настройка дней недели ==="
+        echo "Выберите дни недели для отправки уведомлений:"
+        echo "0) Воскресенье"
+        echo "1) Понедельник"
+        echo "2) Вторник"
+        echo "3) Среда"
+        echo "4) Четверг"
+        echo "5) Пятница"
+        echo "6) Суббота"
+        echo "7) Все дни"
+        echo ""
+        echo "Введите номера дней через запятую (например: 1,2,3,4,5 для рабочих дней):"
+        read schedule_days_input
+        
+        if [ -z "$schedule_days_input" ]; then
+            echo "Используются все дни"
+            SCHEDULE_DAYS="0,1,2,3,4,5,6"
+        elif [[ "$schedule_days_input" =~ ^[0-6](,[0-6])*$ ]] || [ "$schedule_days_input" = "7" ]; then
+            if [ "$schedule_days_input" = "7" ]; then
+                SCHEDULE_DAYS="0,1,2,3,4,5,6"
+            else
+                SCHEDULE_DAYS="$schedule_days_input"
+            fi
+        else
+            echo "⚠️  Неверный формат, используются все дни"
+            SCHEDULE_DAYS="0,1,2,3,4,5,6"
+        fi
+        
+        echo ""
+        echo "=== Настройка часов ==="
+        echo "Выберите часы для отправки уведомлений:"
+        echo "1) Все часы (0-23)"
+        echo "2) Рабочее время (8-20)"
+        echo "3) Ночное время (20-8)"
+        echo "4) Указать свои часы"
+        read -p "Ваш выбор (1-4): " hours_choice
+        
+        case $hours_choice in
+            1)
+                SCHEDULE_HOURS="0-23"
+                ;;
+            2)
+                SCHEDULE_HOURS="8-20"
+                ;;
+            3)
+                SCHEDULE_HOURS="20-8"
+                ;;
+            4)
+                echo ""
+                echo "Введите часы для отправки уведомлений:"
+                echo "Формат: отдельные часы через запятую (0,1,2) или диапазон (8-17)"
+                echo "Можно комбинировать: 0-5,8,12-14,18-23"
+                read custom_hours
+                if [ -n "$custom_hours" ]; then
+                    SCHEDULE_HOURS="$custom_hours"
+                else
+                    SCHEDULE_HOURS="0-23"
+                fi
+                ;;
+            *)
+                SCHEDULE_HOURS="0-23"
+                ;;
+        esac
+        
+        echo ""
+        echo "=== Настройка минут ==="
+        echo "Выберите минуты для отправки уведомлений:"
+        echo "1) Все минуты (0-59)"
+        echo "2) Каждые 5 минут (0,5,10,15,20,25,30,35,40,45,50,55)"
+        echo "3) Каждые 10 минут (0,10,20,30,40,50)"
+        echo "4) Каждые 15 минут (0,15,30,45)"
+        echo "5) Каждые 30 минут (0,30)"
+        echo "6) Указать свои минуты"
+        read -p "Ваш выбор (1-6): " minutes_choice
+        
+        case $minutes_choice in
+            1)
+                SCHEDULE_MINUTES="0-59"
+                ;;
+            2)
+                SCHEDULE_MINUTES="0,5,10,15,20,25,30,35,40,45,50,55"
+                ;;
+            3)
+                SCHEDULE_MINUTES="0,10,20,30,40,50"
+                ;;
+            4)
+                SCHEDULE_MINUTES="0,15,30,45"
+                ;;
+            5)
+                SCHEDULE_MINUTES="0,30"
+                ;;
+            6)
+                echo ""
+                echo "Введите минуты для отправки уведомлений:"
+                echo "Формат: отдельные минуты через запятую (0,15,30,45) или диапазон (0-30)"
+                echo "Можно комбинировать: 0-15,30,45-59"
+                read custom_minutes
+                if [ -n "$custom_minutes" ]; then
+                    SCHEDULE_MINUTES="$custom_minutes"
+                else
+                    SCHEDULE_MINUTES="0-59"
+                fi
+                ;;
+            *)
+                SCHEDULE_MINUTES="0-59"
+                ;;
+        esac
+        
+        echo ""
+        echo "=== Настройка исключений ==="
+        echo "Добавить исключения (выходные/праздничные дни)?"
+        echo "1) Нет"
+        echo "2) Добавить даты исключений"
+        read -p "Ваш выбор (1-2): " exclude_choice
+        
+        if [ "$exclude_choice" = "2" ]; then
+            echo ""
+            echo "Введите даты исключений в формате ГГГГ-ММ-ДД, через запятую:"
+            echo "Пример: 2024-01-01,2024-01-07,2024-05-01"
+            echo "(оставьте пустым, если не нужно)"
+            read exclude_dates
+            if [ -n "$exclude_dates" ]; then
+                SCHEDULE_EXCLUDE_DATES="$exclude_dates"
+            fi
+        fi
+        
+        echo ""
+        echo "=== Сводка расписания ==="
+        echo "Дни недели: $SCHEDULE_DAYS"
+        echo "Часы: $SCHEDULE_HOURS"
+        echo "Минуты: $SCHEDULE_MINUTES"
+        if [ -n "$SCHEDULE_EXCLUDE_DATES" ]; then
+            echo "Исключения: $SCHEDULE_EXCLUDE_DATES"
+        fi
+    else
+        echo "Используется режим 'Всегда'"
+        SCHEDULE_TYPE="always"
+    fi
+    
+    echo ""
+    echo "=== Настройка событий ==="
+    echo ""
+    
+    echo "Какие события отправлять в Telegram?"
+    echo ""
+    echo "Основные события:"
+    echo "1) Движение (motion) - обнаружение движения"
+    echo "2) Захват видео (capture) - статус захвата видео"
+    echo "3) Ошибки (errors) - критические ошибки системы"
+    echo "4) Запись (recording) - статус записи видео"
+    echo "5) Сохранение файлов (files) - сохранение видео/фото"
+    echo "6) Качество изображения (quality) - изменения качества"
+    echo "7) Сеть (network) - подключение клиентов"
+    echo "8) Все события (all)"
+    echo "9) Только движение (только motion)"
+    echo ""
+    
+    declare -a EVENT_TYPES=()
+    
+    while true; do
+        echo "Выберите типы событий (через запятую, например: 1,3,5):"
+        read events_input
+        
+        if [ -z "$events_input" ]; then
+            echo "❌ Необходимо выбрать хотя бы одно событие"
+            continue
+        fi
+        
+        IFS=',' read -ra events_array <<< "$events_input"
+        
+        valid=true
+        for event in "${events_array[@]}"; do
+            if ! [[ "$event" =~ ^[1-9]$ ]]; then
+                echo "❌ Неверный номер события: $event"
+                valid=false
+                break
+            fi
+        done
+        
+        if $valid; then
+            for event_num in "${events_array[@]}"; do
+                case $event_num in
+                    1) EVENT_TYPES+=("motion") ;;
+                    2) EVENT_TYPES+=("capture") ;;
+                    3) EVENT_TYPES+=("errors") ;;
+                    4) EVENT_TYPES+=("recording") ;;
+                    5) EVENT_TYPES+=("files") ;;
+                    6) EVENT_TYPES+=("quality") ;;
+                    7) EVENT_TYPES+=("network") ;;
+                    8) EVENT_TYPES+=("all") ;;
+                    9) EVENT_TYPES+=("motion_only") ;;
+                esac
+            done
+            break
+        fi
+    done
+    
+    echo ""
+    echo "Выберите минимальный уровень важности для отправки:"
+    echo "1) DEBUG - отладочная информация"
+    echo "2) INFO - информационные сообщения"
+    echo "3) WARNING - предупреждения"
+    echo "4) ERROR - ошибки"
+    echo "5) CRITICAL - критические ошибки"
+    read -p "Ваш выбор (1-5): " log_level
+    
+    case $log_level in
+        1) LOG_LEVEL="DEBUG" ;;
+        2) LOG_LEVEL="INFO" ;;
+        3) LOG_LEVEL="WARNING" ;;
+        4) LOG_LEVEL="ERROR" ;;
+        5) LOG_LEVEL="CRITICAL" ;;
+        *) LOG_LEVEL="INFO" ;;
+    esac
+    
+    echo ""
+    echo "Отправлять критические ошибки вне расписания?"
+    echo "1) Да, критические ошибки отправлять всегда"
+    echo "2) Нет, соблюдать расписание даже для ошибок"
+    read -p "Ваш выбор (1-2): " critical_choice
+    
+    if [ "$critical_choice" = "1" ]; then
+        SEND_CRITICAL_ALWAYS="true"
+    else
+        SEND_CRITICAL_ALWAYS="false"
+    fi
+    
+    echo ""
+    echo "=== Настройка камер ==="
+    echo ""
+    
+    while true; do
+        echo "Введите количество камер для настройки (1-20):"
+        read CAMERA_COUNT
+        if [[ "$CAMERA_COUNT" =~ ^[0-9]+$ ]] && [ "$CAMERA_COUNT" -ge 1 ] && [ "$CAMERA_COUNT" -le 20 ]; then
+            break
+        else
+            echo "❌ Неверное количество. Введите число от 1 до 20"
+        fi
+    done
+    
+    declare -a CAMERA_NUMS
+    declare -a CAMERA_CHAT_IDS
+    declare -a CAMERA_MEDIA_TYPES
+    declare -a CAMERA_VIDEO_DURATIONS
+    declare -a CAMERA_VIDEO_FPS
+    declare -a CAMERA_EVENT_TYPES
+    declare -a CAMERA_SCHEDULES
+    declare -a CAMERA_SEND_TEXT
+    declare -a CAMERA_SEND_MEDIA
+    
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        echo ""
+        echo "=== Камера $i ==="
+        
+        while true; do
+            echo "Введите номер камеры $i в базе Avreg (обычно 1, 2, 3...):"
+            read CAMERA_NUM
+            if [[ "$CAMERA_NUM" =~ ^[0-9]+$ ]] && [ "$CAMERA_NUM" -ge 1 ]; then
+                CAMERA_NUMS[$i]=$CAMERA_NUM
+                break
+            else
+                echo "❌ Неверный номер камеры"
+            fi
+        done
+        
+        echo ""
+        echo "Настройка чата для камеры $CAMERA_NUM:"
+        CHAT_ID=""
+        while true; do
+            echo "Выберите способ указания чата для камеры $CAMERA_NUM:"
+            echo "1) Ввести ID чата вручную"
+            echo "2) Получить ID через бота"
+            echo "3) Использовать общий чат (будет настроен позже)"
+            echo "4) Пропустить и настроить позже"
+            read -p "Ваш выбор (1-4): " chat_choice
+            
+            case $chat_choice in
+                1)
+                    echo ""
+                    echo "Введите ID чата или канала для камеры $CAMERA_NUM:"
+                    echo "(ID чата обычно отрицательный для групп/каналов, например: -1001234567890)"
+                    echo "(ID пользователя положительный, например: 123456789)"
+                    read CHAT_ID
+                    
+                    if check_bot_access "$BOT_TOKEN" "$CHAT_ID"; then
+                        CAMERA_CHAT_IDS[$i]=$CHAT_ID
+                        break
+                    else
+                        echo "Попробовать другой способ?"
+                        continue
+                    fi
+                    ;;
+                2)
+                    CHAT_ID=$(get_chat_id_via_bot "$BOT_TOKEN")
+                    if [ -n "$CHAT_ID" ]; then
+                        if check_bot_access "$BOT_TOKEN" "$CHAT_ID"; then
+                            CAMERA_CHAT_IDS[$i]=$CHAT_ID
+                            break
+                        fi
+                    fi
+                    ;;
+                3)
+                    echo "Используется общий чат (будет настроен позже)"
+                    CAMERA_CHAT_IDS[$i]="ОБЩИЙ_ЧАТ"
+                    break
+                    ;;
+                4)
+                    echo "Пропускаем настройку чата для камеры $CAMERA_NUM"
+                    CAMERA_CHAT_IDS[$i]="ВАШ_CHAT_ID_ЗДЕСЬ"
+                    break
+                    ;;
+                *)
+                    echo "Неверный выбор"
+                    ;;
+            esac
+        done
+        
+        echo ""
+        echo "Настройка отправки сообщений для камеры $CAMERA_NUM:"
+        echo "1) Использовать общие настройки отправки сообщений"
+        echo "2) Настроить индивидуально для этой камеры"
+        read -p "Ваш выбор (1-2): " message_override_choice
+        
+        if [ "$message_override_choice" = "1" ]; then
+            CAMERA_SEND_TEXT[$i]="GENERAL"
+            CAMERA_SEND_MEDIA[$i]="GENERAL"
+            echo "   Используются общие настройки: Текст=$SEND_TEXT, Медиа=$SEND_MEDIA"
+        else
+            echo ""
+            echo "Выберите режим отправки для камеры $CAMERA_NUM:"
+            echo "1) Отправлять и текст, и медиа"
+            echo "2) Отправлять только медиа (без текста)"
+            echo "3) Отправлять только текст (без медиа)"
+            read -p "Ваш выбор (1-3): " camera_message_choice
+            
+            case $camera_message_choice in
+                1)
+                    CAMERA_SEND_TEXT[$i]="true"
+                    CAMERA_SEND_MEDIA[$i]="true"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться и текст, и медиа"
+                    ;;
+                2)
+                    CAMERA_SEND_TEXT[$i]="false"
+                    CAMERA_SEND_MEDIA[$i]="true"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться только медиа (без текста)"
+                    ;;
+                3)
+                    CAMERA_SEND_TEXT[$i]="true"
+                    CAMERA_SEND_MEDIA[$i]="false"
+                    echo "✅ Камера $CAMERA_NUM: будут отправляться только текстовые уведомления"
+                    ;;
+                *)
+                    CAMERA_SEND_TEXT[$i]="GENERAL"
+                    CAMERA_SEND_MEDIA[$i]="GENERAL"
+                    echo "⚠️ Используются общие настройки"
+                    ;;
+            esac
+        fi
+        
+        echo ""
+        echo "Настройка расписания для камеры $CAMERA_NUM:"
+        echo "1) Использовать общее расписание"
+        echo "2) Настроить индивидуальное расписание"
+        echo "3) Всегда отправлять (игнорировать расписание)"
+        read -p "Ваш выбор (1-3): " camera_schedule_choice
+        
+        case $camera_schedule_choice in
+            1)
+                CAMERA_SCHEDULES[$i]="GENERAL"
+                ;;
+            2)
+                echo ""
+                echo "=== Индивидуальное расписание для камеры $CAMERA_NUM ==="
+                
+                echo "Выберите дни недели:"
+                echo "0) Воскресенье"
+                echo "1) Понедельник"
+                echo "2) Вторник"
+                echo "3) Среда"
+                echo "4) Четверг"
+                echo "5) Пятница"
+                echo "6) Суббота"
+                echo "7) Все дни"
+                echo ""
+                echo "Введите номера дней через запятую:"
+                read camera_days_input
+                
+                if [ -z "$camera_days_input" ]; then
+                    camera_days="0,1,2,3,4,5,6"
+                elif [[ "$camera_days_input" =~ ^[0-6](,[0-6])*$ ]] || [ "$camera_days_input" = "7" ]; then
+                    if [ "$camera_days_input" = "7" ]; then
+                        camera_days="0,1,2,3,4,5,6"
+                    else
+                        camera_days="$camera_days_input"
+                    fi
+                else
+                    camera_days="0,1,2,3,4,5,6"
+                fi
+                
+                echo ""
+                echo "Введите часы (формат: 0-23 или 8-20 или 0,1,2):"
+                read camera_hours
+                camera_hours=${camera_hours:-"0-23"}
+                
+                echo ""
+                echo "Введите минуты (формат: 0-59 или 0,15,30,45):"
+                read camera_minutes
+                camera_minutes=${camera_minutes:-"0-59"}
+                
+                CAMERA_SCHEDULES[$i]="days:$camera_days;hours:$camera_hours;minutes:$camera_minutes"
+                ;;
+            3)
+                CAMERA_SCHEDULES[$i]="ALWAYS"
+                ;;
+            *)
+                CAMERA_SCHEDULES[$i]="GENERAL"
+                ;;
+        esac
+        
+        echo ""
+        echo "Выберите тип отправляемых медиа для камеры $CAMERA_NUM:"
+        echo "1) Только фото"
+        echo "2) Только видео"
+        echo "3) Фото и видео"
+        read -p "Введите номер варианта (1-3): " media_choice
+        
+        case $media_choice in
+            1) MEDIA_TYPE="photo" ;;
+            2) MEDIA_TYPE="video" ;;
+            3) MEDIA_TYPE="both" ;;
+            *) MEDIA_TYPE="photo" ;;
+        esac
+        CAMERA_MEDIA_TYPES[$i]=$MEDIA_TYPE
+        
+        echo ""
+        echo "Выберите события для камеры $CAMERA_NUM:"
+        echo "1) Использовать общие настройки событий"
+        echo "2) Настроить индивидуально"
+        read -p "Ваш выбор (1-2): " event_choice
+        
+        if [ "$event_choice" = "1" ]; then
+            CAMERA_EVENT_TYPES[$i]="GENERAL"
+        else
+            echo ""
+            echo "Какие события отправлять для камеры $CAMERA_NUM?"
+            echo "1) Движение (motion)"
+            echo "2) Захват видео (capture)"
+            echo "3) Ошибки (errors)"
+            echo "4) Запись (recording)"
+            echo "5) Сохранение файлов (files)"
+            echo "6) Качество изображения (quality)"
+            echo "7) Сеть (network)"
+            echo "8) Все события (all)"
+            echo "9) Только движение (motion_only)"
+            echo ""
+            
+            echo "Выберите типы событий (через запятую, например: 1,3,5):"
+            read camera_events
+            
+            IFS=',' read -ra camera_events_array <<< "$camera_events"
+            local camera_event_string=""
+            for event_num in "${camera_events_array[@]}"; do
+                case $event_num in
+                    1) camera_event_string+="motion," ;;
+                    2) camera_event_string+="capture," ;;
+                    3) camera_event_string+="errors," ;;
+                    4) camera_event_string+="recording," ;;
+                    5) camera_event_string+="files," ;;
+                    6) camera_event_string+="quality," ;;
+                    7) camera_event_string+="network," ;;
+                    8) camera_event_string+="all," ;;
+                    9) camera_event_string+="motion_only," ;;
+                esac
+            done
+            CAMERA_EVENT_TYPES[$i]=$(echo $camera_event_string | sed 's/,$//')
+        fi
+        
+        echo ""
+        echo "Введите длительность видео для захвата с камеры $CAMERA_NUM (в секундах, минимум 5):"
+        read VIDEO_DURATION
+        VIDEO_DURATION=${VIDEO_DURATION:-10}
+        if [ $VIDEO_DURATION -lt 5 ]; then
+            VIDEO_DURATION=5
+        fi
+        CAMERA_VIDEO_DURATIONS[$i]=$VIDEO_DURATION
+        
+        echo ""
+        echo "Введите FPS для видео (качество, 1-30, по умолчанию 5):"
+        read VIDEO_FPS
+        VIDEO_FPS=${VIDEO_FPS:-5}
+        if [ $VIDEO_FPS -lt 1 ]; then
+            VIDEO_FPS=1
+        elif [ $VIDEO_FPS -gt 30 ]; then
+            VIDEO_FPS=30
+        fi
+        CAMERA_VIDEO_FPS[$i]=$VIDEO_FPS
+    done
+    
+    GENERAL_CHAT_ID=""
+    if [[ " ${CAMERA_CHAT_IDS[@]} " =~ "ОБЩИЙ_ЧАТ" ]]; then
+        echo ""
+        echo "=== Настройка общего чата ==="
+        
+        while true; do
+            echo "Выберите способ указания общего чата:"
+            echo "1) Ввести ID общего чата вручную"
+            echo "2) Получить ID через бота"
+            echo "3) Пропустить и настроить позже"
+            read -p "Ваш выбор (1-3): " general_chat_choice
+            
+            case $general_chat_choice in
+                1)
+                    echo ""
+                    echo "Введите ID общего чата или канала:"
+                    read GENERAL_CHAT_ID
+                    
+                    if check_bot_access "$BOT_TOKEN" "$GENERAL_CHAT_ID"; then
+                        for ((i=1; i<=$CAMERA_COUNT; i++)); do
+                            if [ "${CAMERA_CHAT_IDS[$i]}" = "ОБЩИЙ_ЧАТ" ]; then
+                                CAMERA_CHAT_IDS[$i]=$GENERAL_CHAT_ID
+                            fi
+                        done
+                        break
+                    fi
+                    ;;
+                2)
+                    GENERAL_CHAT_ID=$(get_chat_id_via_bot "$BOT_TOKEN")
+                    if [ -n "$GENERAL_CHAT_ID" ]; then
+                        if check_bot_access "$BOT_TOKEN" "$GENERAL_CHAT_ID"; then
+                            for ((i=1; i<=$CAMERA_COUNT; i++)); do
+                                if [ "${CAMERA_CHAT_IDS[$i]}" = "ОБЩИЙ_ЧАТ" ]; then
+                                    CAMERA_CHAT_IDS[$i]=$GENERAL_CHAT_ID
+                                fi
+                            done
+                            break
+                        fi
+                    fi
+                    ;;
+                3)
+                    echo "Пропускаем настройку общего чата"
+                    break
+                    ;;
+                *)
+                    echo "Неверный выбор"
+                    ;;
+            esac
+        done
+    fi
+    
+    echo ""
+    echo "Введите ваш логин в Avreg:"
+    read login
+    login=${login:-admin}
+    
+    echo ""
+    echo "Введите пароль для Avreg (оставьте пустым если не требуется):"
+    read -s avreg_password
+    echo ""
+    
+    echo ""
+    echo "Введите URL сервера avreg (нажмите Enter для использования localhost):"
+    read AVREG_URL
+    AVREG_URL=${AVREG_URL:-localhost}
+    
+    echo ""
+    echo "Проверка доступности Avreg на ${AVREG_URL}:874..."
+    if timeout 5 curl -s "http://${AVREG_URL}:874" > /dev/null; then
+        echo "✅ Avreg доступен"
+    else
+        echo "⚠️  Не удалось подключиться к Avreg. Проверьте URL и порт 874"
+    fi
+    
+    # Создание конфигурационного файла
+    cat <<EOF > "$CONFIG_FILE"
+#!/bin/bash
+# Конфигурация Telegram бота для Avreg
+# Файл создан: $(date)
+# Версия: 1.7
+
+# Данные бота Telegram
+BOT_TOKEN='$BOT_TOKEN'
+
+# Настройки прокси
+PROXY_TYPE='$PROXY_TYPE'
+PROXY_HOST='$PROXY_HOST'
+PROXY_PORT='$PROXY_PORT'
+PROXY_USER='$PROXY_USER'
+PROXY_PASS='$PROXY_PASS'
+PROXY_MT_PROTO='$PROXY_MT_PROTO'
+PROXY_MT_SECRET='$PROXY_MT_SECRET'
+
+# Настройки отправки сообщений
+SEND_TEXT='$SEND_TEXT'
+SEND_MEDIA='$SEND_MEDIA'
+
+# Настройки расписания
+SCHEDULE_ENABLED='$SCHEDULE_ENABLED'
+SCHEDULE_TYPE='$SCHEDULE_TYPE'
+SCHEDULE_DAYS='$SCHEDULE_DAYS'
+SCHEDULE_HOURS='$SCHEDULE_HOURS'
+SCHEDULE_MINUTES='$SCHEDULE_MINUTES'
+SCHEDULE_EXCLUDE_DATES='${SCHEDULE_EXCLUDE_DATES:-}'
+SEND_CRITICAL_ALWAYS='$SEND_CRITICAL_ALWAYS'
+
+# Настройки событий
+EVENT_TYPES=($(printf '"%s" ' "${EVENT_TYPES[@]}"))
+LOG_LEVEL='$LOG_LEVEL'
+
+# Количество камер
+CAMERA_COUNT=$CAMERA_COUNT
+
+# Массивы с настройками камер
+EOF
+
+    echo "declare -a CAMERA_NUMS=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_NUMS[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_NUMS[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_CHAT_IDS=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_CHAT_IDS[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_CHAT_IDS[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_MEDIA_TYPES=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_MEDIA_TYPES[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_MEDIA_TYPES[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_EVENT_TYPES=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_EVENT_TYPES[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_EVENT_TYPES[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_SCHEDULES=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_SCHEDULES[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_SCHEDULES[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_VIDEO_DURATIONS=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_VIDEO_DURATIONS[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_VIDEO_DURATIONS[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_VIDEO_FPS=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_VIDEO_FPS[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_VIDEO_FPS[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_SEND_TEXT=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_SEND_TEXT[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_SEND_TEXT[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    echo "" >> "$CONFIG_FILE"
+    echo "declare -a CAMERA_SEND_MEDIA=(\\" >> "$CONFIG_FILE"
+    for ((i=1; i<=$CAMERA_COUNT; i++)); do
+        if [ $i -eq $CAMERA_COUNT ]; then
+            echo "  \"${CAMERA_SEND_MEDIA[$i]}\")" >> "$CONFIG_FILE"
+        else
+            echo "  \"${CAMERA_SEND_MEDIA[$i]}\" \\" >> "$CONFIG_FILE"
+        fi
+    done
+    
+    cat <<EOF >> "$CONFIG_FILE"
+
+# Функция для создания curl команды с прокси
+get_curl_cmd() {
+    local curl_cmd="curl -s"
+    
+    case "\$PROXY_TYPE" in
+        "socks5")
+            if [ -n "\$PROXY_USER" ] && [ -n "\$PROXY_PASS" ]; then
+                curl_cmd="\$curl_cmd --socks5 \$PROXY_HOST:\$PROXY_PORT --socks5-user \$PROXY_USER:\$PROXY_PASS"
+            else
+                curl_cmd="\$curl_cmd --socks5 \$PROXY_HOST:\$PROXY_PORT"
+            fi
+            ;;
+        "http")
+            if [ -n "\$PROXY_USER" ] && [ -n "\$PROXY_PASS" ]; then
+                curl_cmd="\$curl_cmd --proxy \$PROXY_HOST:\$PROXY_PORT --proxy-user \$PROXY_USER:\$PROXY_PASS"
+            else
+                curl_cmd="\$curl_cmd --proxy \$PROXY_HOST:\$PROXY_PORT"
+            fi
+            ;;
+        "mtproto")
+            curl_cmd="\$curl_cmd"
+            ;;
+        *)
+            ;;
+    esac
+    
+    echo "\$curl_cmd"
+}
+
+# Функция получения настроек камеры по номеру в базе
+get_camera_config() {
+    local camera_num=\$1
+    local camera_index=-1
+    
+    for ((i=0; i<\$CAMERA_COUNT; i++)); do
+        if [ "\${CAMERA_NUMS[\$i]}" = "\$camera_num" ]; then
+            camera_index=\$i
+            break
+        fi
+    done
+    
+    if [ \$camera_index -eq -1 ]; then
+        echo "Ошибка: Камера \$camera_num не найдена в конфигурации" >&2
+        return 1
+    fi
+    
+    export CHAT_ID="\${CAMERA_CHAT_IDS[\$camera_index]}"
+    export MEDIA_TYPE="\${CAMERA_MEDIA_TYPES[\$camera_index]}"
+    export EVENT_TYPE="\${CAMERA_EVENT_TYPES[\$camera_index]}"
+    export CAMERA_SCHEDULE="\${CAMERA_SCHEDULES[\$camera_index]}"
+    export VIDEO_DURATION="\${CAMERA_VIDEO_DURATIONS[\$camera_index]}"
+    export VIDEO_FPS="\${CAMERA_VIDEO_FPS[\$camera_index]}"
+    export CAMERA_SEND_TEXT_SETTING="\${CAMERA_SEND_TEXT[\$camera_index]}"
+    export CAMERA_SEND_MEDIA_SETTING="\${CAMERA_SEND_MEDIA[\$camera_index]}"
+    
+    return 0
+}
+
+# Функция получения настроек отправки сообщений для камеры
+get_camera_message_settings() {
+    local camera_num=\$1
+    
+    local send_text="\$SEND_TEXT"
+    local send_media="\$SEND_MEDIA"
+    
+    if [ -n "\$camera_num" ]; then
+        get_camera_config "\$camera_num" 2>/dev/null
+        if [ -n "\$CAMERA_SEND_TEXT_SETTING" ] && [ "\$CAMERA_SEND_TEXT_SETTING" != "GENERAL" ]; then
+            send_text="\$CAMERA_SEND_TEXT_SETTING"
+        fi
+        if [ -n "\$CAMERA_SEND_MEDIA_SETTING" ] && [ "\$CAMERA_SEND_MEDIA_SETTING" != "GENERAL" ]; then
+            send_media="\$CAMERA_SEND_MEDIA_SETTING"
+        fi
+    fi
+    
+    export SHOULD_SEND_TEXT="\$send_text"
+    export SHOULD_SEND_MEDIA="\$send_media"
+    
+    return 0
+}
+
+# Функция проверки, нужно ли отправлять событие
+should_send_event() {
+    local event_name=\$1
+    local event_level=\$2
+    local camera_num=\$3
+    
+    local camera_event_settings="\${EVENT_TYPES[@]}"
+    if [ -n "\$camera_num" ]; then
+        get_camera_config "\$camera_num" 2>/dev/null
+        if [ -n "\$EVENT_TYPE" ] && [ "\$EVENT_TYPE" != "GENERAL" ]; then
+            camera_event_settings=\$EVENT_TYPE
+        fi
+    fi
+    
+    local level_num=0
+    case "\$LOG_LEVEL" in
+        "DEBUG") level_num=1 ;;
+        "INFO") level_num=2 ;;
+        "WARNING") level_num=3 ;;
+        "ERROR") level_num=4 ;;
+        "CRITICAL") level_num=5 ;;
+    esac
+    
+    local event_level_num=0
+    case "\$event_level" in
+        "debug") event_level_num=1 ;;
+        "info") event_level_num=2 ;;
+        "warning") event_level_num=3 ;;
+        "error") event_level_num=4 ;;
+        "critical") event_level_num=5 ;;
+    esac
+    
+    if [ \$event_level_num -lt \$level_num ]; then
+        return 1
+    fi
+    
+    if [[ " \${camera_event_settings[@]} " =~ " all " ]]; then
+        if check_schedule "\$camera_num" "\$event_name" "\$event_level"; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    
+    if [[ " \${camera_event_settings[@]} " =~ " \$event_name " ]]; then
+        if check_schedule "\$camera_num" "\$event_name" "\$event_level"; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    
+    if [[ " \${camera_event_settings[@]} " =~ " motion_only " ]] && [ "\$event_name" = "motion" ]; then
+        if check_schedule "\$camera_num" "\$event_name" "\$event_level"; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+    
+    return 1
+}
+
+# Функция проверки расписания
+check_schedule() {
+    local camera_num=\$1
+    local event_name=\$2
+    local event_level=\$3
+    
+    if [ "\$SCHEDULE_ENABLED" = "false" ]; then
+        return 0
+    fi
+    
+    if [ "\$SCHEDULE_TYPE" = "always" ]; then
+        return 0
+    fi
+    
+    if [ "\$event_level" = "critical" ] && [ "\$SEND_CRITICAL_ALWAYS" = "true" ]; then
+        return 0
+    fi
+    
+    local schedule_settings="\$SCHEDULE_DAYS;\$SCHEDULE_HOURS;\$SCHEDULE_MINUTES"
+    if [ -n "\$camera_num" ]; then
+        get_camera_config "\$camera_num" 2>/dev/null
+        if [ -n "\$CAMERA_SCHEDULE" ]; then
+            if [ "\$CAMERA_SCHEDULE" = "ALWAYS" ]; then
+                return 0
+            elif [ "\$CAMERA_SCHEDULE" = "GENERAL" ]; then
+                schedule_settings="\$SCHEDULE_DAYS;\$SCHEDULE_HOURS;\$SCHEDULE_MINUTES"
+            else
+                schedule_settings="\$CAMERA_SCHEDULE"
+            fi
+        fi
+    fi
+    
+    local current_day=\$(date +%w)
+    local current_hour=\$(date +%H)
+    local current_minute=\$(date +%M)
+    local current_date=\$(date +%Y-%m-%d)
+    
+    if [ -n "\$SCHEDULE_EXCLUDE_DATES" ]; then
+        IFS=',' read -ra exclude_dates <<< "\$SCHEDULE_EXCLUDE_DATES"
+        for exclude_date in "\${exclude_dates[@]}"; do
+            if [ "\$current_date" = "\$exclude_date" ]; then
+                return 1
+            fi
+        done
+    fi
+    
+    IFS=';' read -ra schedule_parts <<< "\$schedule_settings"
+    
+    local days_part="\${schedule_parts[0]#days:}"
+    local hours_part="\${schedule_parts[1]#hours:}"
+    local minutes_part="\${schedule_parts[2]#minutes:}"
+    
+    if ! check_time_part "\$current_day" "\$days_part" "day"; then
+        return 1
+    fi
+    
+    if ! check_time_part "\$current_hour" "\$hours_part" "hour"; then
+        return 1
+    fi
+    
+    if ! check_time_part "\$current_minute" "\$minutes_part" "minute"; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Функция проверки части времени
+check_time_part() {
+    local current_value=\$1
+    local schedule_part=\$2
+    local part_type=\$3
+    
+    if [ -z "\$schedule_part" ]; then
+        return 0
+    fi
+    
+    schedule_part=\$(echo "\$schedule_part" | tr -d ' ')
+    
+    IFS=',' read -ra parts <<< "\$schedule_part"
+    
+    for part in "\${parts[@]}"; do
+        if [[ "\$part" =~ ^([0-9]+)-([0-9]+)\$ ]]; then
+            local start=\${BASH_REMATCH[1]}
+            local end=\${BASH_REMATCH[2]}
+            
+            if [ "\$part_type" = "hour" ] || [ "\$part_type" = "minute" ]; then
+                if [ \$start -le \$end ]; then
+                    if [ \$current_value -ge \$start ] && [ \$current_value -le \$end ]; then
+                        return 0
+                    fi
+                else
+                    if [ \$current_value -ge \$start ] || [ \$current_value -le \$end ]; then
+                        return 0
+                    fi
+                fi
+            else
+                if [ \$current_value -ge \$start ] && [ \$current_value -le \$end ]; then
+                    return 0
+                fi
+            fi
+        elif [[ "\$part" =~ ^[0-9]+\$ ]]; then
+            if [ "\$current_value" -eq "\$part" ]; then
+                return 0
+            fi
+        fi
+    done
+    
+    return 1
+}
+
+# Функция получения имени события по коду
+get_event_name() {
+    local evt_id=\$1
+    case \$evt_id in
+        1) echo "system" ;;
+        2) echo "critical_error" ;;
+        3) echo "capture" ;;
+        4) echo "network" ;;
+        5) echo "recording" ;;
+        13) echo "motion_start" ;;
+        14) echo "motion_end" ;;
+        15|16|17) echo "snapshot" ;;
+        22) echo "quality" ;;
+        12|23) echo "video_saved" ;;
+        32) echo "audio_saved" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Данные для доступа к Avreg
+login="$login"
+avreg_password="$avreg_password"
+AVREG_URL='$AVREG_URL'
+
+# Общие настройки
+VIDEO_MAX_SIZE=$VIDEO_MAX_SIZE
+
+# Пути к файлам
+TEMP_DIR="/tmp/avreg_telegram"
+LOG_FILE="/tmp/telegram_bot.log"
+
+EOF
+
+    echo ""
+    echo "✅ Конфигурация сохранена в $CONFIG_FILE"
+}
+
+# ==================== СОЗДАНИЕ ОСНОВНОГО СКРИПТА ====================
+
+create_script() {
+    cat <<'EOF' > "$SCRIPT_FILE"
+#!/bin/bash
+
+# Загрузка конфигурации
+if [ -f /etc/avreg/scripts/telegram_config.sh ]; then
+    source /etc/avreg/scripts/telegram_config.sh
+else
+    echo "Ошибка: Конфигурационный файл не найден!" >&2
+    exit 1
+fi
+
+if [ -z "$BOT_TOKEN" ] || [ "$BOT_TOKEN" = "ВАШ_BOT_TOKEN_ЗДЕСЬ" ]; then
+    echo "Ошибка: BOT_TOKEN не настроен!" >&2
+    exit 1
+fi
+
+MODE="event"
+CAMERA_NUM=""
+EVENT_DATA=""
+FILE_PATH=""
+FILE_TYPE=""
+
+if [ "$1" = "motion" ] && [ -n "$2" ]; then
+    MODE="motion"
+    CAMERA_NUM="$2"
+elif [ "$1" = "send_file" ] && [ -n "$2" ] && [ -n "$3" ] && [ -n "$4" ]; then
+    MODE="send_file"
+    CAMERA_NUM="$2"
+    FILE_PATH="$3"
+    FILE_TYPE="$4"
+elif [ "$1" = "test" ] && [ -n "$2" ]; then
+    MODE="test"
+    CAMERA_NUM="$2"
+elif [ "$1" = "event" ]; then
+    MODE="event"
+    if [ -n "$2" ]; then
+        EVENT_DATA="$2"
+    fi
+elif [ "$1" = "schedule" ]; then
+    MODE="schedule"
+    if [ -n "$2" ]; then
+        CAMERA_NUM="$2"
+    fi
+else
+    if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        MODE="motion"
+        CAMERA_NUM="$1"
+    else
+        echo "Использование:" >&2
+        echo "  Для отправки файлов:  $0 send_file <номер_камеры> <путь_к_файлу> <snapshot|video>" >&2
+        echo "  Для движения:          $0 motion <номер_камеры>" >&2
+        echo "  Для событий:           $0 event <данные_события>" >&2
+        echo "  Для теста:             $0 test <номер_камеры>" >&2
+        echo "  Для расписания:        $0 schedule [номер_камеры]" >&2
+        echo "" >&2
+        echo "Доступные камеры в конфигурации:" >&2
+        for ((i=0; i<CAMERA_COUNT; i++)); do
+            echo "  Камера ${CAMERA_NUMS[$i]}: Чат ${CAMERA_CHAT_IDS[$i]}, Тип: ${CAMERA_MEDIA_TYPES[$i]}" >&2
+        done
+        exit 1
+    fi
+fi
+
+if [ "$MODE" = "motion" ] || [ "$MODE" = "test" ] || [ "$MODE" = "schedule" ] || [ "$MODE" = "send_file" ]; then
+    if [ -n "$CAMERA_NUM" ]; then
+        if ! get_camera_config "$CAMERA_NUM"; then
+            echo "Ошибка: Камера $CAMERA_NUM не найдена в конфигурации" >&2
+            exit 1
+        fi
+        
+        if [ -z "$CHAT_ID" ] || [ "$CHAT_ID" = "ВАШ_CHAT_ID_ЗДЕСЬ" ] || [ "$CHAT_ID" = "ОБЩИЙ_ЧАТ" ]; then
+            echo "Ошибка: CHAT_ID для камеры $CAMERA_NUM не настроен!" >&2
+            echo "Настройте чат для камеры $CAMERA_NUM в конфигурационном файле" >&2
+            exit 1
+        fi
+    fi
+fi
+
+mkdir -p "$TEMP_DIR"
+
+timestamp=$(date +%s)
+IMAGE_FILE="${TEMP_DIR}/cam${CAMERA_NUM}_${timestamp}.jpg"
+VIDEO_FILE="${TEMP_DIR}/cam${CAMERA_NUM}_${timestamp}.mjpg"
+CONVERTED_VIDEO_FILE="${TEMP_DIR}/cam${CAMERA_NUM}_${timestamp}.mp4"
+
+log_message() {
+    local level="$1"
+    local message="$2"
+    local event_name="${3:-system}"
+    
+    if should_send_event "$event_name" "$level" "$CAMERA_NUM"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $level - $event_name - Камера ${CAMERA_NUM:-N/A} - $message" >> "$LOG_FILE"
+        
+        if [ "$level" = "warning" ] || [ "$level" = "error" ] || [ "$level" = "critical" ]; then
+            echo "Камера ${CAMERA_NUM:-N/A} ($event_name): $message" >&2
+        fi
+        
+        return 0
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $level - $event_name - Камера ${CAMERA_NUM:-N/A} - $message (не отправлено - вне расписания)" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+check_telegram_api() {
+    local curl_cmd=$(get_curl_cmd)
+    local response=$($curl_cmd -w "%{http_code}" "https://api.telegram.org/bot${BOT_TOKEN}/getMe" -o /dev/null)
+    
+    if [ "$response" != "200" ]; then
+        log_message "error" "Ошибка доступа к Telegram API (HTTP код: $response)" "system"
+        return 1
+    fi
+    return 0
+}
+
+get_auth_header() {
+    if [ -n "$avreg_password" ]; then
+        echo -n "${login}:${avreg_password}"
+    else
+        echo -n "${login}:"
+    fi | base64 -w 0
+}
+
+get_image() {
+    local auth_value=$(get_auth_header)
+    local url="http://${AVREG_URL}:874/avreg-cgi/jpg/image.cgi?camera=${CAMERA_NUM}&ab=${auth_value}"
+    
+    log_message "info" "Запрос изображения с камеры $CAMERA_NUM" "capture"
+    
+    wget --timeout=10 --tries=2 -q "$url" -O "$IMAGE_FILE" 2>> "$LOG_FILE"
+    local wget_status=$?
+    
+    if [ $wget_status -eq 0 ] && [ -f "$IMAGE_FILE" ] && [ -s "$IMAGE_FILE" ]; then
+        local file_size=$(stat -c%s "$IMAGE_FILE" 2>/dev/null || echo "0")
+        log_message "info" "Изображение получено: $IMAGE_FILE (${file_size} байт)" "capture"
+        
+        if file "$IMAGE_FILE" | grep -q "image"; then
+            return 0
+        else
+            log_message "warning" "Полученный файл не является изображением" "capture"
+            return 1
+        fi
+    else
+        log_message "error" "Ошибка получения изображения (код: $wget_status)" "capture"
+        return 1
+    fi
+}
+
+get_video() {
+    local auth_value=$(get_auth_header)
+    
+    log_message "info" "Запрос MJPG потока с камеры $CAMERA_NUM (длительность: ${VIDEO_DURATION}сек, FPS: ${VIDEO_FPS})" "capture"
+    
+    local mjpg_url="http://${AVREG_URL}:874/avreg-cgi/mjpg/video.cgi?camera=${CAMERA_NUM}"
+    mjpg_url="${mjpg_url}&fps=${VIDEO_FPS}"
+    mjpg_url="${mjpg_url}&ab=${auth_value}"
+    
+    log_message "debug" "URL MJPG потока: $(echo $mjpg_url | sed 's/ab=[^&]*/ab=***/')" "capture"
+    
+    rm -f "$VIDEO_FILE" "$CONVERTED_VIDEO_FILE" 2>/dev/null
+    
+    log_message "info" "Захват MJPG потока..." "capture"
+    timeout ${VIDEO_DURATION} curl -s "$mjpg_url" > "$VIDEO_FILE" 2>> "$LOG_FILE"
+    local curl_status=$?
+    
+    if [ ! -f "$VIDEO_FILE" ] || [ ! -s "$VIDEO_FILE" ]; then
+        log_message "error" "Не удалось получить MJPG поток (статус curl: $curl_status)" "capture"
+        return 1
+    fi
+    
+    local mjpg_size=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || echo "0")
+    log_message "info" "MJPG поток сохранен: $VIDEO_FILE (${mjpg_size} байт)" "capture"
+    
+    if ! file "$VIDEO_FILE" | grep -q "JPEG" && ! file "$VIDEO_FILE" | grep -q "MJPG" && ! file "$VIDEO_FILE" | grep -q "MPEG"; then
+        log_message "warning" "Полученный файл может не быть валидным MJPG потоком" "capture"
+    fi
+    
+    if command -v ffmpeg >/dev/null 2>&1; then
+        log_message "info" "Конвертация MJPG в MP4 через ffmpeg..." "capture"
+        
+        local fps_for_conversion=$VIDEO_FPS
+        if [ $fps_for_conversion -lt 1 ]; then
+            fps_for_conversion=1
+        elif [ $fps_for_conversion -gt 30 ]; then
+            fps_for_conversion=30
+        fi
+        
+        ffmpeg -y \
+            -loglevel error \
+            -f mjpeg \
+            -r ${fps_for_conversion} \
+            -i "$VIDEO_FILE" \
+            -c:v libx264 \
+            -preset ultrafast \
+            -crf 28 \
+            -pix_fmt yuv420p \
+            -r ${fps_for_conversion} \
+            -f mp4 \
+            "$CONVERTED_VIDEO_FILE" 2>> "$LOG_FILE"
+        
+        local ffmpeg_status=$?
+        
+        if [ $ffmpeg_status -eq 0 ] && [ -f "$CONVERTED_VIDEO_FILE" ] && [ -s "$CONVERTED_VIDEO_FILE" ]; then
+            local mp4_size=$(stat -c%s "$CONVERTED_VIDEO_FILE" 2>/dev/null || echo "0")
+            log_message "info" "Видео сконвертировано в MP4: $CONVERTED_VIDEO_FILE (${mp4_size} байт, сжатие: $((mjpg_size - mp4_size)) байт)" "capture"
+            
+            rm -f "$VIDEO_FILE" 2>/dev/null
+            VIDEO_FILE="$CONVERTED_VIDEO_FILE"
+            return 0
+        else
+            log_message "warning" "Ошибка конвертации через ffmpeg (код: $ffmpeg_status), используем оригинальный MJPG" "capture"
+            
+            if [ $mjpg_size -gt $VIDEO_MAX_SIZE ]; then
+                log_message "warning" "MJPG файл слишком большой ($mjpg_size байт), попытка уменьшить через ffmpeg..." "capture"
+                
+                ffmpeg -y \
+                    -loglevel error \
+                    -i "$VIDEO_FILE" \
+                    -t $((VIDEO_DURATION > 60 ? 60 : VIDEO_DURATION)) \
+                    -c:v libx264 \
+                    -preset ultrafast \
+                    -crf 32 \
+                    -pix_fmt yuv420p \
+                    -f mp4 \
+                    "$CONVERTED_VIDEO_FILE" 2>> "$LOG_FILE"
+                
+                if [ $? -eq 0 ] && [ -f "$CONVERTED_VIDEO_FILE" ] && [ -s "$CONVERTED_VIDEO_FILE" ]; then
+                    local reduced_size=$(stat -c%s "$CONVERTED_VIDEO_FILE" 2>/dev/null || echo "0")
+                    log_message "info" "Видео уменьшено: $CONVERTED_VIDEO_FILE (${reduced_size} байт)" "capture"
+                    rm -f "$VIDEO_FILE" 2>/dev/null
+                    VIDEO_FILE="$CONVERTED_VIDEO_FILE"
+                    return 0
+                fi
+            fi
+            
+            return 0
+        fi
+    else
+        log_message "warning" "ffmpeg не установлен, используем оригинальный MJPG файл" "capture"
+        
+        if [ $mjpg_size -gt $VIDEO_MAX_SIZE ]; then
+            log_message "warning" "MJPG файл слишком большой ($mjpg_size байт > $VIDEO_MAX_SIZE байт)" "capture"
+            log_message "info" "Установите ffmpeg для автоматического сжатия видео" "capture"
+        fi
+        
+        return 0
+    fi
+}
+
+send_telegram_message() {
+    local message="$1"
+    local event_name="${2:-system}"
+    
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_TEXT" != "true" ]; then
+        log_message "debug" "Текстовое сообщение не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
+    
+    if ! check_schedule "$CAMERA_NUM" "$event_name" "info"; then
+        log_message "debug" "Сообщение не отправлено: вне расписания" "$event_name"
+        return 1
+    fi
+    
+    if ! check_telegram_api; then
+        log_message "error" "Невозможно отправить сообщение: Telegram API недоступен" "$event_name"
+        return 1
+    fi
+    
+    local curl_cmd=$(get_curl_cmd)
+    local response=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${message}\"}" \
+        -w "%{http_code}")
+    
+    local http_code=${response: -3}
+    local json_response=${response%???}
+    
+    if [ "$http_code" = "200" ] && echo "$json_response" | grep -q '"ok":true'; then
+        log_message "info" "Сообщение отправлено: ${message:0:50}..." "$event_name"
+        return 0
+    else
+        log_message "error" "Ошибка отправки сообщения" "$event_name"
+        log_message "debug" "HTTP код: $http_code" "$event_name"
+        log_message "debug" "Ответ: $json_response" "$event_name"
+        
+        if echo "$json_response" | grep -q '"error_code":400'; then
+            log_message "warning" "Неверный запрос (возможно неверный CHAT_ID)" "$event_name"
+        elif echo "$json_response" | grep -q '"error_code":401'; then
+            log_message "error" "Неверный токен бота" "$event_name"
+        elif echo "$json_response" | grep -q '"error_code":403'; then
+            log_message "warning" "Бот заблокирован пользователем или не в чате" "$event_name"
+        elif echo "$json_response" | grep -q '"error_code":404'; then
+            log_message "error" "Чат не найден" "$event_name"
+        fi
+        
+        return 1
+    fi
+}
+
+send_telegram_photo() {
+    local event_name="${1:-motion}"
+    local photo_file="$2"
+    
+    if [ -z "$photo_file" ]; then
+        photo_file="$IMAGE_FILE"
+    fi
+    
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_MEDIA" != "true" ]; then
+        log_message "debug" "Медиа не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
+    
+    if [ ! -f "$photo_file" ] || [ ! -s "$photo_file" ]; then
+        log_message "warning" "Файл изображения не существует или пуст: $photo_file" "$event_name"
+        return 1
+    fi
+    
+    if ! check_schedule "$CAMERA_NUM" "$event_name" "info"; then
+        log_message "debug" "Фото не отправлено: вне расписания" "$event_name"
+        return 1
+    fi
+    
+    if ! check_telegram_api; then
+        return 1
+    fi
+    
+    log_message "info" "Отправка фото в Telegram: $photo_file" "$event_name"
+    
+    local caption=""
+    if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+        caption="📸 Камера ${CAMERA_NUM}: Движение обнаружено ($(date '+%Y-%m-%d %H:%M:%S'))"
+    fi
+    
+    local curl_cmd=$(get_curl_cmd)
+    local response=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+        -F "chat_id=${CHAT_ID}" \
+        -F "photo=@${photo_file}" \
+        -F "caption=${caption}" \
+        -w "%{http_code}")
+    
+    local http_code=${response: -3}
+    local json_response=${response%???}
+    
+    if [ "$http_code" = "200" ] && echo "$json_response" | grep -q '"ok":true'; then
+        log_message "info" "Фото успешно отправлено" "$event_name"
+        return 0
+    else
+        log_message "error" "Ошибка отправки фото" "$event_name"
+        log_message "debug" "HTTP код: $http_code" "$event_name"
+        log_message "debug" "Ответ: $json_response" "$event_name"
+        return 1
+    fi
+}
+
+send_telegram_video() {
+    local event_name="${1:-motion}"
+    local video_file="$2"
+    
+    if [ -z "$video_file" ]; then
+        video_file="$VIDEO_FILE"
+    fi
+    
+    get_camera_message_settings "$CAMERA_NUM"
+    if [ "$SHOULD_SEND_MEDIA" != "true" ]; then
+        log_message "debug" "Медиа не отправляется (отключено в настройках)" "$event_name"
+        return 0
+    fi
+    
+    if [ ! -f "$video_file" ] || [ ! -s "$video_file" ]; then
+        log_message "warning" "Файл видео не существует или пуст: $video_file" "$event_name"
+        return 1
+    fi
+    
+    if ! check_schedule "$CAMERA_NUM" "$event_name" "info"; then
+        log_message "debug" "Видео не отправлено: вне расписания" "$event_name"
+        return 1
+    fi
+    
+    if ! check_telegram_api; then
+        return 1
+    fi
+    
+    local file_size=$(stat -c%s "$video_file" 2>/dev/null || echo "0")
+    local file_ext="${video_file##*.}"
+    
+    log_message "info" "Попытка отправки видео (размер: ${file_size} байт, расширение: $file_ext, файл: $video_file)" "$event_name"
+    
+    local caption=""
+    if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+        caption="🎥 Камера ${CAMERA_NUM}: Видео движения ($(date '+%Y-%m-%d %H:%M:%S'))"
+    fi
+    
+    local curl_cmd=$(get_curl_cmd)
+    local response=""
+    
+    if [[ "$video_file" == *.mp4 ]] || file "$video_file" | grep -q "MP4"; then
+        log_message "info" "Отправляем MP4 как видео" "$event_name"
+        
+        response=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendVideo" \
+            -F "chat_id=${CHAT_ID}" \
+            -F "video=@${video_file}" \
+            -F "caption=${caption}" \
+            -w "%{http_code}")
+    else
+        log_message "info" "Отправляем как документ (формат: $file_ext)" "$event_name"
+        
+        response=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${CHAT_ID}" \
+            -F "document=@${video_file}" \
+            -F "caption=${caption}" \
+            -w "%{http_code}")
+    fi
+    
+    local http_code=${response: -3}
+    local json_response=${response%???}
+    
+    if [ "$http_code" = "200" ] && echo "$json_response" | grep -q '"ok":true'; then
+        log_message "info" "Видео успешно отправлено" "$event_name"
+        return 0
+    else
+        log_message "error" "Ошибка отправки видео" "$event_name"
+        log_message "debug" "HTTP код: $http_code" "$event_name"
+        log_message "debug" "Ответ: $json_response" "$event_name"
+        
+        if [[ "$video_file" == *.mp4 ]]; then
+            log_message "warning" "Пробуем отправить MP4 как документ..." "$event_name"
+            
+            response=$($curl_cmd -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${CHAT_ID}" \
+                -F "document=@${video_file}" \
+                -F "caption=${caption}" \
+                -w "%{http_code}")
+            
+            local http_code2=${response: -3}
+            local json_response2=${response%???}
+            
+            if [ "$http_code2" = "200" ] && echo "$json_response2" | grep -q '"ok":true'; then
+                log_message "info" "Видео отправлено как документ" "$event_name"
+                return 0
+            else
+                log_message "error" "Ошибка отправки как документ" "$event_name"
+                return 1
+            fi
+        fi
+        
+        return 1
+    fi
+}
+
+send_file() {
+    local file_path="$FILE_PATH"
+    local file_type="$FILE_TYPE"
+    
+    log_message "info" "=== Отправка готового файла: $file_path (тип: $file_type) ===" "files"
+    
+    if [ ! -f "$file_path" ]; then
+        log_message "error" "Файл не существует: $file_path" "files"
+        return 1
+    fi
+    
+    if ! check_telegram_api; then
+        log_message "error" "Telegram API недоступен, пропускаем отправку" "files"
+        return 1
+    fi
+    
+    if ! should_send_event "files" "info" "$CAMERA_NUM"; then
+        log_message "debug" "Событие сохранения файла не отправляется (вне расписания или настройки фильтрации)" "files"
+        return 0
+    fi
+    
+    get_camera_message_settings "$CAMERA_NUM"
+    
+    if [ "$file_type" = "snapshot" ]; then
+        if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
+            send_telegram_photo "files" "$file_path"
+        else
+            log_message "info" "Отправка медиа отключена для камеры $CAMERA_NUM" "files"
+        fi
+    elif [ "$file_type" = "video" ]; then
+        if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
+            send_telegram_video "files" "$file_path"
+        else
+            log_message "info" "Отправка медиа отключена для камеры $CAMERA_NUM" "files"
+        fi
+    else
+        log_message "error" "Неизвестный тип файла: $file_type" "files"
+        return 1
+    fi
+    
+    log_message "info" "=== Отправка файла завершена ===" "files"
+}
+
+process_motion_event() {
+    log_message "info" "=== Обработка события движения на камере $CAMERA_NUM (старый режим) ===" "motion"
+    
+    if ! check_telegram_api; then
+        log_message "error" "Telegram API недоступен, пропускаем отправку" "motion"
+        return 1
+    fi
+    
+    if ! should_send_event "motion" "info" "$CAMERA_NUM"; then
+        log_message "debug" "Событие движения не отправляется (вне расписания или настройки фильтрации)" "motion"
+        return 0
+    fi
+    
+    local message="🚨 Камера ${CAMERA_NUM}: Движение обнаружено в $(date '+%H:%M:%S')"
+    if ! send_telegram_message "$message" "motion"; then
+        log_message "warning" "Не удалось отправить текстовое уведомление" "motion"
+    fi
+    
+    get_camera_message_settings "$CAMERA_NUM"
+    
+    if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
+        case $MEDIA_TYPE in
+            "photo")
+                if get_image; then
+                    send_telegram_photo "motion"
+                fi
+                ;;
+            "video")
+                sleep 1
+                if get_video; then
+                    send_telegram_video "motion"
+                fi
+                ;;
+            "both")
+                if get_image; then
+                    send_telegram_photo "motion"
+                fi
+                sleep 1
+                if get_video; then
+                    send_telegram_video "motion"
+                fi
+                ;;
+        esac
+    else
+        log_message "info" "Отправка медиа отключена для камеры $CAMERA_NUM" "motion"
+    fi
+    
+    cleanup_temp_files
+    
+    log_message "info" "=== Обработка события движения завершена ===" "motion"
+}
+
+process_system_event() {
+    local event_data="$1"
+    
+    IFS='|' read -ra event_parts <<< "$event_data"
+    
+    local event_id="${event_parts[0]}"
+    local camera_num="${event_parts[1]}"
+    local dt_event="${event_parts[2]}"
+    local dt_prev="${event_parts[3]}"
+    local status="${event_parts[4]}"
+    local subsystem="${event_parts[5]}"
+    local media_type="${event_parts[6]}"
+    local description="${event_parts[7]}"
+    
+    local event_name=$(get_event_name "$event_id")
+    local level="info"
+    
+    case $event_id in
+        1|2)
+            if [ "$status" = "3" ] || [ "$event_id" = "2" ]; then
+                level="critical"
+            else
+                level="info"
+            fi
+            ;;
+        3)
+            if [ "$status" = "3" ]; then
+                level="error"
+            else
+                level="info"
+            fi
+            ;;
+        5)
+            level="warning"
+            ;;
+        13|14)
+            level="info"
+            ;;
+        22)
+            level="warning"
+            ;;
+        *)
+            level="info"
+            ;;
+    esac
+    
+    CAMERA_NUM="$camera_num"
+    
+    if [ -n "$camera_num" ] && [ "$camera_num" != "0" ]; then
+        if get_camera_config "$camera_num" 2>/dev/null; then
+            if ! should_send_event "$event_name" "$level" "$camera_num"; then
+                log_message "debug" "Событие $event_name не отправляется (вне расписания или настройки фильтрации)" "$event_name"
+                return 0
+            fi
+            
+            if ! check_telegram_api; then
+                log_message "error" "Telegram API недоступен, пропускаем отправку" "$event_name"
+                return 1
+            fi
+            
+            local message=""
+            local emoji=""
+            
+            case $event_id in
+                1)
+                    case $status in
+                        0) message="🟢 Система Avreg запущена"; emoji="🟢" ;;
+                        1) message="🔴 Система Avreg остановлена"; emoji="🔴" ;;
+                        2) message="🔄 Перезагрузка конфигурации"; emoji="🔄" ;;
+                        3) message="🚨 Критическая ошибка: $description"; emoji="🚨" ;;
+                    esac
+                    ;;
+                2)
+                    message="🚨 Критическая ошибка: $description"
+                    emoji="🚨"
+                    ;;
+                3)
+                    case $status in
+                        0) message="🎥 Камера $camera_num: Захват начат"; emoji="🎥" ;;
+                        1) message="⏹️ Камера $camera_num: Захват остановлен"; emoji="⏹️" ;;
+                        3) message="❌ Камера $camera_num: Ошибка захвата: $description"; emoji="❌" ;;
+                    esac
+                    ;;
+                4)
+                    case $status in
+                        0) message="📡 Камера $camera_num: Новый клиент подключен"; emoji="📡" ;;
+                        1) message="📡 Камера $camera_num: Клиент отключен"; emoji="📡" ;;
+                    esac
+                    ;;
+                5)
+                    case $status in
+                        4) message="⏺️ Камера $camera_num: Запись начата"; emoji="⏺️" ;;
+                        3) message="⏹️ Камера $camera_num: Запись остановлена"; emoji="⏹️" ;;
+                        6) message="✅ Камера $camera_num: Запись включена"; emoji="✅" ;;
+                        7) message="⭕ Камера $camera_num: Запись отключена"; emoji="⭕" ;;
+                    esac
+                    ;;
+                13)
+                    message="🚨 Камера $camera_num: Движение обнаружено"
+                    emoji="🚨"
+                    ;;
+                14)
+                    message="✅ Камера $camera_num: Движение прекратилось"
+                    emoji="✅"
+                    ;;
+                15|16|17)
+                    message="📸 Камера $camera_num: Снапшот сохранен"
+                    emoji="📸"
+                    ;;
+                22)
+                    message="📊 Камера $camera_num: Изменение качества: $description"
+                    emoji="📊"
+                    ;;
+                12|23)
+                    message="💾 Камера $camera_num: Видеофайл сохранен"
+                    emoji="💾"
+                    ;;
+                32)
+                    message="🎵 Камера $camera_num: Аудиофайл сохранен"
+                    emoji="🎵"
+                    ;;
+                *)
+                    message="ℹ️ Камера $camera_num: Событие $event_id: $description"
+                    emoji="ℹ️"
+                    ;;
+            esac
+            
+            if [ -n "$dt_event" ]; then
+                message="$message (время: $dt_event)"
+            fi
+            
+            get_camera_message_settings "$camera_num"
+            if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+                send_telegram_message "$message" "$event_name"
+            else
+                log_message "debug" "Текстовое сообщение для события $event_name не отправлено (отключено в настройках)" "$event_name"
+            fi
+            
+            log_message "$level" "Событие $event_name: $description" "$event_name"
+        else
+            log_message "debug" "Камера $camera_num не найдена в конфигурации, событие пропущено" "$event_name"
+        fi
+    else
+        if should_send_event "$event_name" "$level" ""; then
+            local message=""
+            case $event_id in
+                1)
+                    case $status in
+                        0) message="🟢 Система Avreg запущена" ;;
+                        1) message="🔴 Система Avreg остановлена" ;;
+                        2) message="🔄 Перезагрузка конфигурации" ;;
+                        3) message="🚨 Критическая ошибка: $description" ;;
+                    esac
+                    ;;
+                2)
+                    message="🚨 Критическая ошибка: $description"
+                    ;;
+            esac
+            
+            if [ -n "$message" ]; then
+                if [ $CAMERA_COUNT -gt 0 ]; then
+                    CHAT_ID="${CAMERA_CHAT_IDS[0]}"
+                    if [ "$CHAT_ID" != "ВАШ_CHAT_ID_ЗДЕСЬ" ] && [ "$CHAT_ID" != "ОБЩИЙ_ЧАТ" ]; then
+                        get_camera_message_settings ""
+                        if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+                            if check_schedule "" "$event_name" "$level"; then
+                                if check_telegram_api; then
+                                    send_telegram_message "$message" "$event_name"
+                                fi
+                            else
+                                log_message "debug" "Системное событие не отправлено: вне расписания" "$event_name"
+                            fi
+                        else
+                            log_message "debug" "Системное событие не отправлено: текст отключен" "$event_name"
+                        fi
+                    fi
+                fi
+            fi
+            
+            log_message "$level" "Системное событие: $description" "$event_name"
+        fi
+    fi
+}
+
+check_schedule_mode() {
+    echo "=== Проверка расписания ==="
+    echo ""
+    
+    local camera_num="$1"
+    local current_day=$(date +%w)
+    local current_hour=$(date +%H)
+    local current_minute=$(date +%M)
+    local current_date=$(date +%Y-%m-%d)
+    
+    echo "Текущее время:"
+    echo "  Дата: $current_date"
+    echo "  День недели: $current_day (0=воскресенье)"
+    echo "  Час: $current_hour"
+    echo "  Минута: $current_minute"
+    echo ""
+    
+    if [ -n "$camera_num" ]; then
+        echo "Проверка для камеры $camera_num:"
+        if get_camera_config "$camera_num" 2>/dev/null; then
+            echo "  Чат ID: $CHAT_ID"
+            echo "  Расписание: $CAMERA_SCHEDULE"
+            
+            if check_schedule "$camera_num" "test" "info"; then
+                echo "  ✅ Время в расписании - отправка разрешена"
+            else
+                echo "  ❌ Время вне расписания - отправка запрещена"
+            fi
+        else
+            echo "  ❌ Камера не найдена в конфигурации"
+        fi
+    else
+        echo "Общие настройки расписания:"
+        echo "  Тип: $SCHEDULE_TYPE"
+        echo "  Дни: $SCHEDULE_DAYS"
+        echo "  Часы: $SCHEDULE_HOURS"
+        echo "  Минуты: $SCHEDULE_MINUTES"
+        
+        if [ -n "$SCHEDULE_EXCLUDE_DATES" ]; then
+            echo "  Исключения: $SCHEDULE_EXCLUDE_DATES"
+        fi
+        
+        echo ""
+        echo "Проверка общего расписания:"
+        if check_schedule "" "test" "info"; then
+            echo "  ✅ Время в расписании - отправка разрешена"
+        else
+            echo "  ❌ Время вне расписания - отправка запрещена"
+        fi
+        
+        echo ""
+        echo "Проверка всех камер:"
+        for ((i=0; i<CAMERA_COUNT; i++)); do
+            local cam_num=${CAMERA_NUMS[$i]}
+            local chat_id=${CAMERA_CHAT_IDS[$i]}
+            local schedule=${CAMERA_SCHEDULES[$i]}
+            
+            if [ "$chat_id" != "ВАШ_CHAT_ID_ЗДЕСЬ" ] && [ "$chat_id" != "ОБЩИЙ_ЧАТ" ]; then
+                echo "  Камера $cam_num:"
+                echo "    Расписание: $schedule"
+                
+                if check_schedule "$cam_num" "test" "info"; then
+                    echo "    ✅ Время в расписании"
+                else
+                    echo "    ❌ Время вне расписания"
+                fi
+            fi
+        done
+    fi
+    
+    echo ""
+    echo "Настройки отправки критических ошибок:"
+    echo "  Отправлять критические ошибки всегда: $SEND_CRITICAL_ALWAYS"
+    
+    echo ""
+    echo "Тест различных уровней событий:"
+    for level in "info" "warning" "error" "critical"; do
+        if check_schedule "$camera_num" "test" "$level"; then
+            echo "  $level: ✅ Отправка разрешена"
+        else
+            echo "  $level: ❌ Отправка запрещена"
+        fi
+    done
+}
+
+cleanup_temp_files() {
+    rm -f "$IMAGE_FILE" 2>/dev/null
+    rm -f "$VIDEO_FILE" 2>/dev/null
+    rm -f "$CONVERTED_VIDEO_FILE" 2>/dev/null
+    find "$TEMP_DIR" -type f -mmin +60 -delete 2>/dev/null
+    rmdir "$TEMP_DIR" 2>/dev/null || true
+}
+
+trap cleanup_temp_files EXIT INT TERM
+
+case "$MODE" in
+    "motion")
+        process_motion_event
+        ;;
+    "send_file")
+        send_file
+        ;;
+    "test")
+        echo "=== ТЕСТОВЫЙ РЕЖИМ ДЛЯ КАМЕРЫ $CAMERA_NUM ===" >&2
+        echo "Конфигурация:" >&2
+        echo "  Бот: $(echo ${BOT_TOKEN:0:10})..." >&2
+        echo "  Чат ID: $CHAT_ID" >&2
+        echo "  Камера: $CAMERA_NUM" >&2
+        echo "  Тип медиа: $MEDIA_TYPE" >&2
+        echo "  Длительность видео: ${VIDEO_DURATION}сек" >&2
+        echo "  FPS видео: ${VIDEO_FPS}" >&2
+        echo "  Расписание: $CAMERA_SCHEDULE" >&2
+        
+        get_camera_message_settings "$CAMERA_NUM"
+        echo "  Отправка текста: $SHOULD_SEND_TEXT" >&2
+        echo "  Отправка медиа: $SHOULD_SEND_MEDIA" >&2
+        
+        if ! check_schedule "$CAMERA_NUM" "test" "info"; then
+            echo "⚠️  ВНИМАНИЕ: Текущее время вне расписания!" >&2
+            echo "   Тестовое сообщение будет отправлено, но реальные события - нет." >&2
+            echo "" >&2
+        fi
+        
+        if [ "$SHOULD_SEND_TEXT" = "true" ]; then
+            send_telegram_message "🔧 Камера ${CAMERA_NUM}: Тестовое сообщение от системы Avreg. Если вы видите это, все работает правильно!" "test"
+            
+            if [ $? -eq 0 ]; then
+                echo "✅ Тестовое сообщение отправлено успешно!" >&2
+            else
+                echo "❌ Ошибка отправки тестового сообщения" >&2
+            fi
+        else
+            echo "⚠️  Отправка текстовых сообщений отключена для этой камеры" >&2
+        fi
+        
+        if [ "$SHOULD_SEND_MEDIA" = "true" ]; then
+            case $MEDIA_TYPE in
+                "photo")
+                    echo "Отправка тестового фото..." >&2
+                    if get_image; then
+                        send_telegram_photo "test"
+                        echo "✅ Тестовое фото отправлено!" >&2
+                    else
+                        echo "❌ Ошибка получения тестового фото" >&2
+                    fi
+                    ;;
+                "video")
+                    echo "Отправка тестового видео..." >&2
+                    if get_video; then
+                        send_telegram_video "test"
+                        echo "✅ Тестовое видео отправлено!" >&2
+                    else
+                        echo "❌ Ошибка получения тестового видео" >&2
+                    fi
+                    ;;
+                "both")
+                    echo "Отправка тестового фото и видео..." >&2
+                    if get_image; then
+                        send_telegram_photo "test"
+                        echo "✅ Тестовое фото отправлено!" >&2
+                    else
+                        echo "❌ Ошибка получения тестового фото" >&2
+                    fi
+                    sleep 1
+                    if get_video; then
+                        send_telegram_video "test"
+                        echo "✅ Тестовое видео отправлено!" >&2
+                    else
+                        echo "❌ Ошибка получения тестового видео" >&2
+                    fi
+                    ;;
+            esac
+        else
+            echo "⚠️  Отправка медиа отключена для этой камеры" >&2
+        fi
+        
+        echo "Проверьте чат Telegram" >&2
+        echo "Смотрите подробности в логе: $LOG_FILE" >&2
+        
+        cleanup_temp_files
+        ;;
+    "event")
+        if [ -n "$EVENT_DATA" ]; then
+            process_system_event "$EVENT_DATA"
+        else
+            echo "Ошибка: Не переданы данные события" >&2
+            exit 1
+        fi
+        ;;
+    "schedule")
+        check_schedule_mode "$CAMERA_NUM"
+        ;;
+esac
+
+EOF
+
+    sudo chown "$AVREG_USER:$AVREG_GROUP" "$SCRIPT_FILE"
+    sudo chmod 0755 "$SCRIPT_FILE"
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        sudo chown "$AVREG_USER:$AVREG_GROUP" "$CONFIG_FILE"
+        sudo chmod 0640 "$CONFIG_FILE"
+    fi
+    
+    echo "✅ Скрипт создан: $SCRIPT_FILE"
+    echo "✅ Владелец: $AVREG_USER:$AVREG_GROUP"
+    echo "✅ Права: 0755 для tg.sh, 0640 для config.sh"
+}
+
+# ==================== РЕДАКТОР КОНФИГУРАЦИИ ====================
+
+create_config_editor() {
+    cat <<'EOF' > "$CONFIG_EDITOR"
+#!/bin/bash
+
+# Скрипт для редактирования конфигурации Telegram уведомлений Avreg
+# Версия 1.7 - Поддержка прокси
+
+CONFIG_FILE="/etc/avreg/scripts/telegram_config.sh"
+TEMP_CONFIG="/tmp/telegram_config_edit.sh"
+BACKUP_DIR="/etc/avreg/scripts/backups"
+
+create_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local backup_file="$BACKUP_DIR/telegram_config_$(date +%Y%m%d_%H%M%S).sh"
+    cp "$CONFIG_FILE" "$backup_file"
+    echo "✅ Создана резервная копия: $backup_file"
+}
+
+edit_proxy_settings() {
+    echo ""
+    echo "=== Редактирование настроек прокси ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие настройки прокси:"
+    echo "  Тип: $PROXY_TYPE"
+    echo "  Хост: $PROXY_HOST"
+    echo "  Порт: $PROXY_PORT"
+    [ -n "$PROXY_USER" ] && echo "  Логин: $PROXY_USER"
+    echo ""
+    
+    echo "Выберите тип прокси:"
+    echo "1) Без прокси (прямое соединение)"
+    echo "2) SOCKS5 прокси"
+    echo "3) MTProto прокси (Telegram)"
+    echo "4) HTTP/HTTPS прокси"
+    read -p "Ваш выбор (1-4): " proxy_type
+    
+    PROXY_TYPE="none"
+    PROXY_HOST=""
+    PROXY_PORT=""
+    PROXY_USER=""
+    PROXY_PASS=""
+    PROXY_MT_PROTO=""
+    PROXY_MT_SECRET=""
+    
+    case $proxy_type in
+        2)
+            PROXY_TYPE="socks5"
+            echo ""
+            read -p "Введите хост прокси: " PROXY_HOST
+            read -p "Введите порт прокси: " PROXY_PORT
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        3)
+            PROXY_TYPE="mtproto"
+            echo ""
+            read -p "Введите хост MTProto прокси: " PROXY_HOST
+            read -p "Введите порт MTProto прокси: " PROXY_PORT
+            read -p "Введите секрет для MTProto (если есть): " PROXY_MT_SECRET
+            if [ -n "$PROXY_MT_SECRET" ]; then
+                PROXY_MT_PROTO="true"
+            else
+                PROXY_MT_PROTO="false"
+            fi
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        4)
+            PROXY_TYPE="http"
+            echo ""
+            read -p "Введите хост прокси: " PROXY_HOST
+            read -p "Введите порт прокси: " PROXY_PORT
+            read -p "Введите логин (оставьте пустым если без авторизации): " PROXY_USER
+            if [ -n "$PROXY_USER" ]; then
+                read -s -p "Введите пароль: " PROXY_PASS
+                echo ""
+            fi
+            ;;
+        *)
+            PROXY_TYPE="none"
+            echo "✅ Используется прямое соединение"
+            ;;
+    esac
+    
+    sed -i "s/^PROXY_TYPE='.*'/PROXY_TYPE='$PROXY_TYPE'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_HOST='.*'/PROXY_HOST='$PROXY_HOST'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_PORT='.*'/PROXY_PORT='$PROXY_PORT'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_USER='.*'/PROXY_USER='$PROXY_USER'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_PASS='.*'/PROXY_PASS='$PROXY_PASS'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_MT_PROTO='.*'/PROXY_MT_PROTO='$PROXY_MT_PROTO'/" "$CONFIG_FILE"
+    sed -i "s/^PROXY_MT_SECRET='.*'/PROXY_MT_SECRET='$PROXY_MT_SECRET'/" "$CONFIG_FILE"
+    
+    echo "✅ Настройки прокси обновлены"
+}
+
+edit_message_settings() {
+    echo ""
+    echo "=== Редактирование общих настроек отправки сообщений ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие настройки:"
+    echo "  Отправлять текст: $SEND_TEXT"
+    echo "  Отправлять медиа: $SEND_MEDIA"
+    echo ""
+    
+    echo "Выберите режим отправки:"
+    echo "1) Отправлять и текст, и медиа"
+    echo "2) Отправлять только медиа (без текста)"
+    echo "3) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-3): " message_choice
+    
+    case $message_choice in
+        1)
+            SEND_TEXT="true"
+            SEND_MEDIA="true"
+            echo "✅ Настройки обновлены: будут отправляться и текст, и медиа"
+            ;;
+        2)
+            SEND_TEXT="false"
+            SEND_MEDIA="true"
+            echo "✅ Настройки обновлены: будут отправляться только медиа (без текста)"
+            ;;
+        3)
+            SEND_TEXT="true"
+            SEND_MEDIA="false"
+            echo "✅ Настройки обновлены: будут отправляться только текстовые уведомления"
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    sed -i "s/^SEND_TEXT='.*'/SEND_TEXT='$SEND_TEXT'/" "$CONFIG_FILE"
+    sed -i "s/^SEND_MEDIA='.*'/SEND_MEDIA='$SEND_MEDIA'/" "$CONFIG_FILE"
+}
+
+edit_bot_token() {
+    echo ""
+    echo "=== Редактирование токена бота ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущий токен: $(echo ${BOT_TOKEN:0:10})..."
+    echo ""
+    echo "Введите новый токен бота:"
+    read NEW_BOT_TOKEN
+    
+    if [ -z "$NEW_BOT_TOKEN" ]; then
+        echo "❌ Токен не может быть пустым"
+        return 1
+    fi
+    
+    sed -i "s/BOT_TOKEN='.*'/BOT_TOKEN='$NEW_BOT_TOKEN'/" "$CONFIG_FILE"
+    echo "✅ Токен бота обновлен"
+}
+
+edit_camera_chat() {
+    echo ""
+    echo "=== Редактирование чата камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Чат ${CAMERA_CHAT_IDS[$i]}"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    local current_chat=${CAMERA_CHAT_IDS[$array_index]}
+    
+    echo ""
+    echo "Редактирование камеры $camera_num"
+    echo "Текущий Chat ID: $current_chat"
+    echo ""
+    echo "Введите новый Chat ID:"
+    read NEW_CHAT_ID
+    
+    if [ -z "$NEW_CHAT_ID" ]; then
+        echo "❌ Chat ID не может быть пустым"
+        return 1
+    fi
+    
+    awk -v idx="$array_index" -v new_chat="$NEW_CHAT_ID" '
+    /^declare -a CAMERA_CHAT_IDS=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_CHAT_IDS=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_chat "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_CHAT_IDS=(" array_line ")"
+            print "  \"" new_chat "\")"
+        } else {
+            print "declare -a CAMERA_CHAT_IDS=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Chat ID камеры $camera_num обновлен на: $NEW_CHAT_ID"
+}
+
+edit_camera_media_type() {
+    echo ""
+    echo "=== Редактирование типа медиа камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Тип медиа ${CAMERA_MEDIA_TYPES[$i]}"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    local current_type=${CAMERA_MEDIA_TYPES[$array_index]}
+    
+    echo ""
+    echo "Редактирование камеры $camera_num"
+    echo "Текущий тип медиа: $current_type"
+    echo ""
+    echo "Выберите новый тип медиа:"
+    echo "1) Только фото"
+    echo "2) Только видео"
+    echo "3) Фото и видео"
+    read -p "Ваш выбор (1-3): " media_choice
+    
+    case $media_choice in
+        1) NEW_TYPE="photo" ;;
+        2) NEW_TYPE="video" ;;
+        3) NEW_TYPE="both" ;;
+        *) echo "❌ Неверный выбор"; return 1 ;;
+    esac
+    
+    awk -v idx="$array_index" -v new_type="$NEW_TYPE" '
+    /^declare -a CAMERA_MEDIA_TYPES=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_MEDIA_TYPES=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_type "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_MEDIA_TYPES=(" array_line ")"
+            print "  \"" new_type "\")"
+        } else {
+            print "declare -a CAMERA_MEDIA_TYPES=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Тип медиа камеры $camera_num обновлен на: $NEW_TYPE"
+}
+
+edit_events() {
+    echo ""
+    echo "=== Редактирование настроек событий ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие настройки событий:"
+    echo "Типы событий: ${EVENT_TYPES[@]}"
+    echo "Уровень логирования: $LOG_LEVEL"
+    echo ""
+    
+    echo "Какие события отправлять в Telegram?"
+    echo ""
+    echo "Основные события:"
+    echo "1) Движение (motion) - обнаружение движения"
+    echo "2) Захват видео (capture) - статус захвата видео"
+    echo "3) Ошибки (errors) - критические ошибки системы"
+    echo "4) Запись (recording) - статус записи видео"
+    echo "5) Сохранение файлов (files) - сохранение видео/фото"
+    echo "6) Качество изображения (quality) - изменения качества"
+    echo "7) Сеть (network) - подключение клиентов"
+    echo "8) Все события (all)"
+    echo "9) Только движение (только motion)"
+    echo ""
+    
+    echo "Текущие события: ${EVENT_TYPES[@]}"
+    echo "Введите новые типы событий (через запятую, например: 1,3,5):"
+    read events_input
+    
+    if [ -z "$events_input" ]; then
+        echo "❌ Необходимо выбрать хотя бы одно событие"
+        return 1
+    fi
+    
+    IFS=',' read -ra events_array <<< "$events_input"
+    declare -a new_event_types=()
+    
+    for event_num in "${events_array[@]}"; do
+        case $event_num in
+            1) new_event_types+=("motion") ;;
+            2) new_event_types+=("capture") ;;
+            3) new_event_types+=("errors") ;;
+            4) new_event_types+=("recording") ;;
+            5) new_event_types+=("files") ;;
+            6) new_event_types+=("quality") ;;
+            7) new_event_types+=("network") ;;
+            8) new_event_types+=("all") ;;
+            9) new_event_types+=("motion_only") ;;
+            *) echo "❌ Неверный номер события: $event_num"; return 1 ;;
+        esac
+    done
+    
+    echo ""
+    echo "Текущий уровень логирования: $LOG_LEVEL"
+    echo "Выберите новый уровень важности для отправки:"
+    echo "1) DEBUG - отладочная информация"
+    echo "2) INFO - информационные сообщения"
+    echo "3) WARNING - предупреждения"
+    echo "4) ERROR - ошибки"
+    echo "5) CRITICAL - критические ошибки"
+    read -p "Ваш выбор (1-5): " log_level
+    
+    case $log_level in
+        1) NEW_LOG_LEVEL="DEBUG" ;;
+        2) NEW_LOG_LEVEL="INFO" ;;
+        3) NEW_LOG_LEVEL="WARNING" ;;
+        4) NEW_LOG_LEVEL="ERROR" ;;
+        5) NEW_LOG_LEVEL="CRITICAL" ;;
+        *) NEW_LOG_LEVEL="$LOG_LEVEL" ;;
+    esac
+    
+    local event_types_str=$(printf "'%s' " "${new_event_types[@]}")
+    sed -i "s/^EVENT_TYPES=(.*)/EVENT_TYPES=($event_types_str)/" "$CONFIG_FILE"
+    sed -i "s/^LOG_LEVEL='.*'/LOG_LEVEL='$NEW_LOG_LEVEL'/" "$CONFIG_FILE"
+    
+    echo "✅ Настройки событий обновлены"
+    echo "   Типы событий: ${new_event_types[@]}"
+    echo "   Уровень логирования: $NEW_LOG_LEVEL"
+}
+
+edit_camera_events() {
+    echo ""
+    echo "=== Редактирование событий камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: События ${CAMERA_EVENT_TYPES[$i]}"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    local current_events=${CAMERA_EVENT_TYPES[$array_index]}
+    
+    echo ""
+    echo "Редактирование событий для камеры $camera_num"
+    echo "Текущие события: $current_events"
+    echo ""
+    echo "Выберите настройки событий:"
+    echo "1) Использовать общие настройки событий (GENERAL)"
+    echo "2) Настроить индивидуально"
+    read -p "Ваш выбор (1-2): " event_choice
+    
+    case $event_choice in
+        1)
+            NEW_EVENTS="GENERAL"
+            ;;
+        2)
+            echo ""
+            echo "Какие события отправлять для камеры $camera_num?"
+            echo "1) Движение (motion)"
+            echo "2) Захват видео (capture)"
+            echo "3) Ошибки (errors)"
+            echo "4) Запись (recording)"
+            echo "5) Сохранение файлов (files)"
+            echo "6) Качество изображения (quality)"
+            echo "7) Сеть (network)"
+            echo "8) Все события (all)"
+            echo "9) Только движение (motion_only)"
+            echo ""
+            
+            echo "Выберите типы событий (через запятую, например: 1,3,5):"
+            read camera_events
+            
+            IFS=',' read -ra camera_events_array <<< "$camera_events"
+            local camera_event_string=""
+            for event_num in "${camera_events_array[@]}"; do
+                case $event_num in
+                    1) camera_event_string+="motion," ;;
+                    2) camera_event_string+="capture," ;;
+                    3) camera_event_string+="errors," ;;
+                    4) camera_event_string+="recording," ;;
+                    5) camera_event_string+="files," ;;
+                    6) camera_event_string+="quality," ;;
+                    7) camera_event_string+="network," ;;
+                    8) camera_event_string+="all," ;;
+                    9) camera_event_string+="motion_only," ;;
+                    *) echo "❌ Неверный номер события: $event_num"; return 1 ;;
+                esac
+            done
+            NEW_EVENTS=$(echo $camera_event_string | sed 's/,$//')
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    awk -v idx="$array_index" -v new_events="$NEW_EVENTS" '
+    /^declare -a CAMERA_EVENT_TYPES=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_EVENT_TYPES=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_events "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_EVENT_TYPES=(" array_line ")"
+            print "  \"" new_events "\")"
+        } else {
+            print "declare -a CAMERA_EVENT_TYPES=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ События камеры $camera_num обновлены на: $NEW_EVENTS"
+}
+
+edit_schedule() {
+    echo ""
+    echo "=== Редактирование расписания ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие настройки расписания:"
+    echo "  Включено: $SCHEDULE_ENABLED"
+    echo "  Тип: $SCHEDULE_TYPE"
+    echo "  Дни: $SCHEDULE_DAYS"
+    echo "  Часы: $SCHEDULE_HOURS"
+    echo "  Минуты: $SCHEDULE_MINUTES"
+    
+    if [ -n "$SCHEDULE_EXCLUDE_DATES" ]; then
+        echo "  Исключения: $SCHEDULE_EXCLUDE_DATES"
+    fi
+    
+    echo "  Отправлять критические ошибки всегда: $SEND_CRITICAL_ALWAYS"
+    echo ""
+    
+    echo "Выберите действие:"
+    echo "1) Включить/отключить расписание"
+    echo "2) Изменить дни недели"
+    echo "3) Изменить часы"
+    echo "4) Изменить минуты"
+    echo "5) Изменить исключения"
+    echo "6) Настройка отправки критических ошибок"
+    echo "7) Вернуться в меню"
+    read -p "Ваш выбор (1-7): " schedule_choice
+    
+    case $schedule_choice in
+        1)
+            echo ""
+            echo "Текущее состояние: $SCHEDULE_ENABLED"
+            echo "Включить расписание? (true/false):"
+            read new_enabled
+            
+            if [ "$new_enabled" = "true" ] || [ "$new_enabled" = "false" ]; then
+                sed -i "s/^SCHEDULE_ENABLED='.*'/SCHEDULE_ENABLED='$new_enabled'/" "$CONFIG_FILE"
+                echo "✅ Расписание обновлено: $new_enabled"
+            else
+                echo "❌ Неверное значение"
+            fi
+            ;;
+        2)
+            echo ""
+            echo "Текущие дни: $SCHEDULE_DAYS"
+            echo ""
+            echo "Выберите дни недели для отправки уведомлений:"
+            echo "0) Воскресенье"
+            echo "1) Понедельник"
+            echo "2) Вторник"
+            echo "3) Среда"
+            echo "4) Четверг"
+            echo "5) Пятница"
+            echo "6) Суббота"
+            echo "7) Все дни"
+            echo ""
+            echo "Введите номера дней через запятую (например: 1,2,3,4,5 для рабочих дней):"
+            read new_days
+            
+            if [ -n "$new_days" ]; then
+                if [[ "$new_days" =~ ^[0-6](,[0-6])*$ ]] || [ "$new_days" = "7" ]; then
+                    if [ "$new_days" = "7" ]; then
+                        new_days="0,1,2,3,4,5,6"
+                    fi
+                    sed -i "s/^SCHEDULE_DAYS='.*'/SCHEDULE_DAYS='$new_days'/" "$CONFIG_FILE"
+                    echo "✅ Дни недели обновлены: $new_days"
+                else
+                    echo "❌ Неверный формат дней"
+                fi
+            fi
+            ;;
+        3)
+            echo ""
+            echo "Текущие часы: $SCHEDULE_HOURS"
+            echo ""
+            echo "Введите новые часы:"
+            echo "Формат: отдельные часы через запятую (0,1,2) или диапазон (8-17)"
+            echo "Можно комбинировать: 0-5,8,12-14,18-23"
+            read new_hours
+            
+            if [ -n "$new_hours" ]; then
+                sed -i "s/^SCHEDULE_HOURS='.*'/SCHEDULE_HOURS='$new_hours'/" "$CONFIG_FILE"
+                echo "✅ Часы обновлены: $new_hours"
+            fi
+            ;;
+        4)
+            echo ""
+            echo "Текущие минуты: $SCHEDULE_MINUTES"
+            echo ""
+            echo "Введите новые минуты:"
+            echo "Формат: отдельные минуты через запятую (0,15,30,45) или диапазон (0-30)"
+            echo "Можно комбинировать: 0-15,30,45-59"
+            read new_minutes
+            
+            if [ -n "$new_minutes" ]; then
+                sed -i "s/^SCHEDULE_MINUTES='.*'/SCHEDULE_MINUTES='$new_minutes'/" "$CONFIG_FILE"
+                echo "✅ Минуты обновлены: $new_minutes"
+            fi
+            ;;
+        5)
+            echo ""
+            echo "Текущие исключения: ${SCHEDULE_EXCLUDE_DATES:-нет}"
+            echo ""
+            echo "Введите даты исключений в формате ГГГГ-ММ-ДД, через запятую:"
+            echo "Пример: 2024-01-01,2024-01-07,2024-05-01"
+            echo "(оставьте пустым для удаления исключений)"
+            read new_exclude
+            
+            if [ -z "$new_exclude" ]; then
+                sed -i "s/^SCHEDULE_EXCLUDE_DATES='.*'/SCHEDULE_EXCLUDE_DATES=''/" "$CONFIG_FILE"
+                echo "✅ Исключения удалены"
+            else
+                sed -i "s/^SCHEDULE_EXCLUDE_DATES='.*'/SCHEDULE_EXCLUDE_DATES='$new_exclude'/" "$CONFIG_FILE"
+                echo "✅ Исключения обновлены: $new_exclude"
+            fi
+            ;;
+        6)
+            echo ""
+            echo "Текущая настройка: $SEND_CRITICAL_ALWAYS"
+            echo "Отправлять критические ошибки всегда? (true/false):"
+            read new_critical
+            
+            if [ "$new_critical" = "true" ] || [ "$new_critical" = "false" ]; then
+                sed -i "s/^SEND_CRITICAL_ALWAYS='.*'/SEND_CRITICAL_ALWAYS='$new_critical'/" "$CONFIG_FILE"
+                echo "✅ Настройка критических ошибок обновлена: $new_critical"
+            else
+                echo "❌ Неверное значение"
+            fi
+            ;;
+        7)
+            return 0
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            ;;
+    esac
+    
+    return 0
+}
+
+edit_camera_schedule() {
+    echo ""
+    echo "=== Редактирование расписания камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Расписание ${CAMERA_SCHEDULES[$i]}"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    local current_schedule=${CAMERA_SCHEDULES[$array_index]}
+    
+    echo ""
+    echo "Редактирование расписания для камеры $camera_num"
+    echo "Текущее расписание: $current_schedule"
+    echo ""
+    echo "Выберите настройки расписания:"
+    echo "1) Использовать общее расписание (GENERAL)"
+    echo "2) Всегда отправлять (ALWAYS)"
+    echo "3) Настроить индивидуальное расписание"
+    read -p "Ваш выбор (1-3): " schedule_choice
+    
+    case $schedule_choice in
+        1)
+            NEW_SCHEDULE="GENERAL"
+            ;;
+        2)
+            NEW_SCHEDULE="ALWAYS"
+            ;;
+        3)
+            echo ""
+            echo "=== Индивидуальное расписание для камеры $camera_num ==="
+            
+            echo "Введите дни недели (0-6 через запятую, 7=все дни):"
+            read camera_days
+            camera_days=${camera_days:-"0,1,2,3,4,5,6"}
+            
+            echo "Введите часы (формат: 0-23 или 8-20 или 0,1,2):"
+            read camera_hours
+            camera_hours=${camera_hours:-"0-23"}
+            
+            echo "Введите минуты (формат: 0-59 или 0,15,30,45):"
+            read camera_minutes
+            camera_minutes=${camera_minutes:-"0-59"}
+            
+            NEW_SCHEDULE="days:$camera_days;hours:$camera_hours;minutes:$camera_minutes"
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    awk -v idx="$array_index" -v new_schedule="$NEW_SCHEDULE" '
+    /^declare -a CAMERA_SCHEDULES=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_SCHEDULES=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_schedule "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_SCHEDULES=(" array_line ")"
+            print "  \"" new_schedule "\")"
+        } else {
+            print "declare -a CAMERA_SCHEDULES=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Расписание камеры $camera_num обновлено на: $NEW_SCHEDULE"
+}
+
+edit_video_params() {
+    echo ""
+    echo "=== Редактирование параметров видео ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Длительность ${CAMERA_VIDEO_DURATIONS[$i]}сек, FPS ${CAMERA_VIDEO_FPS[$i]}"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    
+    echo ""
+    echo "Редактирование параметров видео для камеры $camera_num"
+    
+    echo "Текущая длительность: ${CAMERA_VIDEO_DURATIONS[$array_index]}сек"
+    echo "Введите новую длительность видео (в секундах, минимум 5):"
+    read NEW_DURATION
+    NEW_DURATION=${NEW_DURATION:-${CAMERA_VIDEO_DURATIONS[$array_index]}}
+    if [ $NEW_DURATION -lt 5 ]; then
+        NEW_DURATION=5
+    fi
+    
+    echo "Текущий FPS: ${CAMERA_VIDEO_FPS[$array_index]}"
+    echo "Введите новый FPS (1-30):"
+    read NEW_FPS
+    NEW_FPS=${NEW_FPS:-${CAMERA_VIDEO_FPS[$array_index]}}
+    if [ $NEW_FPS -lt 1 ]; then
+        NEW_FPS=1
+    elif [ $NEW_FPS -gt 30 ]; then
+        NEW_FPS=30
+    fi
+    
+    awk -v idx="$array_index" -v new_duration="$NEW_DURATION" '
+    /^declare -a CAMERA_VIDEO_DURATIONS=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_VIDEO_DURATIONS=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_duration "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_VIDEO_DURATIONS=(" array_line ")"
+            print "  \"" new_duration "\")"
+        } else {
+            print "declare -a CAMERA_VIDEO_DURATIONS=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    awk -v idx="$array_index" -v new_fps="$NEW_FPS" '
+    /^declare -a CAMERA_VIDEO_FPS=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_VIDEO_FPS=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_fps "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_VIDEO_FPS=(" array_line ")"
+            print "  \"" new_fps "\")"
+        } else {
+            print "declare -a CAMERA_VIDEO_FPS=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Параметры видео камеры $camera_num обновлены:"
+    echo "   Длительность: ${NEW_DURATION}сек"
+    echo "   FPS: ${NEW_FPS}"
+}
+
+edit_camera_message_settings() {
+    echo ""
+    echo "=== Редактирование настроек отправки для камеры ==="
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Текущие камеры в конфигурации:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
+        echo "$((i+1)). Камера ${CAMERA_NUMS[$i]}: Текст=$send_text_display, Медиа=$send_media_display"
+    done
+    
+    echo ""
+    echo "Введите номер камеры для редактирования:"
+    read CAMERA_INDEX
+    
+    if ! [[ $CAMERA_INDEX =~ ^[0-9]+$ ]] || [ $CAMERA_INDEX -lt 1 ] || [ $CAMERA_INDEX -gt $CAMERA_COUNT ]; then
+        echo "❌ Неверный номер камеры"
+        return 1
+    fi
+    
+    local array_index=$((CAMERA_INDEX - 1))
+    local camera_num=${CAMERA_NUMS[$array_index]}
+    
+    echo ""
+    echo "Редактирование настроек отправки для камеры $camera_num"
+    echo ""
+    echo "Выберите режим отправки для этой камеры:"
+    echo "1) Использовать общие настройки"
+    echo "2) Отправлять и текст, и медиа"
+    echo "3) Отправлять только медиа (без текста)"
+    echo "4) Отправлять только текст (без медиа)"
+    read -p "Ваш выбор (1-4): " camera_message_choice
+    
+    case $camera_message_choice in
+        1)
+            NEW_SEND_TEXT="GENERAL"
+            NEW_SEND_MEDIA="GENERAL"
+            ;;
+        2)
+            NEW_SEND_TEXT="true"
+            NEW_SEND_MEDIA="true"
+            ;;
+        3)
+            NEW_SEND_TEXT="false"
+            NEW_SEND_MEDIA="true"
+            ;;
+        4)
+            NEW_SEND_TEXT="true"
+            NEW_SEND_MEDIA="false"
+            ;;
+        *)
+            echo "❌ Неверный выбор"
+            return 1
+            ;;
+    esac
+    
+    awk -v idx="$array_index" -v new_val="$NEW_SEND_TEXT" '
+    /^declare -a CAMERA_SEND_TEXT=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_val "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+            print "  \"" new_val "\")"
+        } else {
+            print "declare -a CAMERA_SEND_TEXT=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    awk -v idx="$array_index" -v new_val="$NEW_SEND_MEDIA" '
+    /^declare -a CAMERA_SEND_MEDIA=\(/ {
+        in_array=1
+        array_line=""
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+        in_array=0
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\\/ {
+        if (array_idx == idx) {
+            array_line = array_line "  \"" new_val "\" \\"
+        } else {
+            array_line = array_line $0
+        }
+        array_idx++
+        next
+    }
+    in_array && /^[[:space:]]*"[^"]*"[[:space:]]*\)/ {
+        if (array_idx == idx) {
+            print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+            print "  \"" new_val "\")"
+        } else {
+            print "declare -a CAMERA_SEND_MEDIA=(" array_line ")"
+            print $0
+        }
+        in_array=0
+        next
+    }
+    !in_array {
+        print $0
+    }
+    ' "$CONFIG_FILE" > "$TEMP_CONFIG" && mv "$TEMP_CONFIG" "$CONFIG_FILE"
+    
+    echo "✅ Настройки отправки для камеры $camera_num обновлены"
+}
+
+test_config() {
+    echo ""
+    echo "=== Тестирование конфигурации ==="
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "❌ Конфигурационный файл не найден"
+        return 1
+    fi
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Проверка токена бота..."
+    
+    local curl_cmd="curl -s"
+    case $PROXY_TYPE in
+        "socks5")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT --socks5-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        "http")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT --proxy-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+    esac
+    
+    local bot_check=$($curl_cmd "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+    if echo "$bot_check" | grep -q '"ok":true'; then
+        local bot_name=$(echo "$bot_check" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
+        echo "✅ Бот: @${bot_name}"
+    else
+        echo "❌ Ошибка проверки бота"
+    fi
+    
+    echo ""
+    if [ "$PROXY_TYPE" != "none" ]; then
+        echo "🌐 Используется прокси: $PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"
+        [ -n "$PROXY_USER" ] && echo "   С авторизацией: $PROXY_USER"
+    else
+        echo "🌐 Используется прямое соединение"
+    fi
+    echo ""
+    echo "Для тестирования камеры выполните:"
+    echo "sudo -u avreg /etc/avreg/scripts/tg.sh test <номер_камеры>"
+    echo ""
+    echo "Для проверки расписания выполните:"
+    echo "sudo -u avreg /etc/avreg/scripts/tg.sh schedule [номер_камеры]"
+    echo ""
+    echo "Для тестирования событий выполните:"
+    echo "sudo -u avreg /etc/avreg/scripts/tg.sh event \"13|1|2024-01-01 12:00:00|2024-01-01 11:59:55|1|2|1|Движение обнаружено\""
+}
+
+view_config() {
+    echo ""
+    echo "=== Текущая конфигурация ==="
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "❌ Конфигурационный файл не найден"
+        return 1
+    fi
+    
+    source "$CONFIG_FILE" 2>/dev/null
+    
+    echo "Основные параметры:"
+    echo "  Бот: $(echo ${BOT_TOKEN:0:10})..."
+    echo "  Avreg URL: $AVREG_URL"
+    echo "  Логин: $login"
+    
+    echo ""
+    echo "Настройки прокси:"
+    echo "  Тип: $PROXY_TYPE"
+    echo "  Хост: $PROXY_HOST"
+    echo "  Порт: $PROXY_PORT"
+    [ -n "$PROXY_USER" ] && echo "  Логин: $PROXY_USER"
+    [ -n "$PROXY_MT_SECRET" ] && echo "  MTProto секрет: $PROXY_MT_SECRET"
+    
+    echo ""
+    echo "Настройки отправки сообщений:"
+    echo "  Отправлять текст: $SEND_TEXT"
+    echo "  Отправлять медиа: $SEND_MEDIA"
+    
+    echo ""
+    echo "Настройки расписания:"
+    echo "  Включено: $SCHEDULE_ENABLED"
+    echo "  Тип: $SCHEDULE_TYPE"
+    echo "  Дни: $SCHEDULE_DAYS"
+    echo "  Часы: $SCHEDULE_HOURS"
+    echo "  Минуты: $SCHEDULE_MINUTES"
+    
+    if [ -n "$SCHEDULE_EXCLUDE_DATES" ]; then
+        echo "  Исключения: $SCHEDULE_EXCLUDE_DATES"
+    fi
+    
+    echo "  Отправлять критические ошибки всегда: $SEND_CRITICAL_ALWAYS"
+    
+    echo ""
+    echo "Настройки событий:"
+    echo "  Типы событий: ${EVENT_TYPES[@]}"
+    echo "  Уровень логирования: $LOG_LEVEL"
+    echo "  Количество камер: $CAMERA_COUNT"
+    echo "  Пользователь скриптов: $AVREG_USER"
+    echo ""
+    
+    echo "Настройки камер:"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
+        echo "  Камера ${CAMERA_NUMS[$i]}:"
+        echo "    Чат ID: ${CAMERA_CHAT_IDS[$i]}"
+        echo "    Тип медиа: ${CAMERA_MEDIA_TYPES[$i]}"
+        echo "    События: ${CAMERA_EVENT_TYPES[$i]}"
+        echo "    Расписание: ${CAMERA_SCHEDULES[$i]}"
+        echo "    Длительность видео: ${CAMERA_VIDEO_DURATIONS[$i]}сек"
+        echo "    FPS видео: ${CAMERA_VIDEO_FPS[$i]}"
+        echo "    Отправка текста: $send_text_display"
+        echo "    Отправка медиа: $send_media_display"
+        echo ""
+    done
+}
+
+show_menu() {
+    while true; do
+        echo ""
+        echo "=== Редактор конфигурации Telegram уведомлений (v1.7) ==="
+        echo "1) Просмотреть текущую конфигурацию"
+        echo "2) Редактировать настройки прокси"
+        echo "3) Редактировать общие настройки отправки сообщений"
+        echo "4) Редактировать настройки отправки для конкретной камеры"
+        echo "5) Редактировать токен бота"
+        echo "6) Редактировать чат для камеры"
+        echo "7) Редактировать тип медиа для камеры"
+        echo "8) Редактировать настройки событий (общие)"
+        echo "9) Редактировать события для камеры"
+        echo "10) Редактировать настройки расписания (общие)"
+        echo "11) Редактировать расписание для камеры"
+        echo "12) Редактировать параметры видео"
+        echo "13) Протестировать конфигурацию"
+        echo "14) Создать резервную копию"
+        echo "15) Выйти"
+        echo ""
+        
+        read -p "Выберите действие (1-15): " choice
+        
+        case $choice in
+            1)
+                view_config
+                ;;
+            2)
+                create_backup
+                edit_proxy_settings
+                ;;
+            3)
+                create_backup
+                edit_message_settings
+                ;;
+            4)
+                create_backup
+                edit_camera_message_settings
+                ;;
+            5)
+                create_backup
+                edit_bot_token
+                ;;
+            6)
+                create_backup
+                edit_camera_chat
+                ;;
+            7)
+                create_backup
+                edit_camera_media_type
+                ;;
+            8)
+                create_backup
+                edit_events
+                ;;
+            9)
+                create_backup
+                edit_camera_events
+                ;;
+            10)
+                create_backup
+                edit_schedule
+                ;;
+            11)
+                create_backup
+                edit_camera_schedule
+                ;;
+            12)
+                create_backup
+                edit_video_params
+                ;;
+            13)
+                test_config
+                ;;
+            14)
+                create_backup
+                ;;
+            15)
+                echo "Выход"
+                exit 0
+                ;;
+            *)
+                echo "❌ Неверный выбор"
+                ;;
+        esac
+    done
+}
+
+if [ "$EUID" -ne 0 ]; then
+    echo "⚠️  Рекомендуется запускать скрипт с правами root (sudo)"
+    read -p "Продолжить? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Конфигурационный файл не найден: $CONFIG_FILE"
+    echo "Сначала запустите основной скрипт настройки"
+    exit 1
+fi
+
+show_menu
+
+EOF
+
+    sudo chown "$AVREG_USER:$AVREG_GROUP" "$CONFIG_EDITOR"
+    sudo chmod 0755 "$CONFIG_EDITOR"
+    
+    echo "✅ Создан скрипт для редактирования конфигурации: $CONFIG_EDITOR"
+    echo "✅ Использование: sudo -u avreg $CONFIG_EDITOR"
+}
+
+# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ИЗ ВЕРСИИ 1.6 ====================
+
+# Функция копирования и настройки event-collector
+setup_event_collector() {
+    echo "=== Настройка event-collector ==="
+    
+    if [ ! -f "$EVENT_COLLECTOR" ]; then
+        echo "event-collector не найден в $EVENT_COLLECTOR"
+        
+        if [ -f "$EVENT_COLLECTOR_SOURCE" ]; then
+            echo "Копирование event-collector из $EVENT_COLLECTOR_SOURCE..."
+            sudo cp "$EVENT_COLLECTOR_SOURCE" "/etc/avreg/scripts/"
+            sudo gunzip -f "/etc/avreg/scripts/event-collector.gz"
+        elif [ -f "$EVENT_COLLECTOR_SOURCE_ALT" ]; then
+            echo "Копирование event-collector из $EVENT_COLLECTOR_SOURCE_ALT..."
+            sudo cp "$EVENT_COLLECTOR_SOURCE_ALT" "/etc/avreg/scripts/"
+            sudo gunzip -f "/etc/avreg/scripts/event-collector.gz"
+        else
+            echo "❌ Исходный файл event-collector не найден"
+            read -p "Укажите путь к event-collector.gz вручную: " custom_path
+            
+            if [ -f "$custom_path" ]; then
+                sudo cp "$custom_path" "/etc/avreg/scripts/"
+                sudo gunzip -f "/etc/avreg/scripts/event-collector.gz"
+                echo "✅ event-collector скопирован"
+            else
+                echo "❌ Файл $custom_path не существует"
+                return 1
+            fi
+        fi
+    fi
+    
+    if [ ! -f "$EVENT_COLLECTOR" ]; then
+        echo "❌ Не удалось создать event-collector"
+        return 1
+    fi
+    
+    echo "✅ event-collector найден: $EVENT_COLLECTOR"
+    
+    local backup_file="${EVENT_COLLECTOR}.backup.$(date +%Y%m%d%H%M%S)"
+    sudo cp "$EVENT_COLLECTOR" "$backup_file"
+    echo "✅ Создана резервная копия: $backup_file"
+    
+    echo "Модификация event-collector для отправки файлов в Telegram..."
+    
+    if grep -q "on_snapshot_saved" "$EVENT_COLLECTOR"; then
+        sudo sed -i '/on_snapshot_saved()/,/^}/ {
+            /log debug/ a\
+    \
+    if [ $evt_id -eq 16 ]; then\
+        if [ -f "/etc/avreg/scripts/tg.sh" ]; then\
+            /etc/avreg/scripts/tg.sh send_file "$cam_nr" "$filename" "snapshot" &\
+            log debug "Telegram: отправка снимка камеры $cam_nr"\
+        else\
+            log debug "Telegram скрипт не найден"\
+        fi\
+    fi
+        }' "$EVENT_COLLECTOR"
+        echo "✅ Добавлен вызов tg.sh в on_snapshot_saved"
+    else
+        sudo sed -i '/^handle_event()/i \
+\
+on_snapshot_saved() {\
+   local evt_id cam_nr ctime motion_session file_sizeKB resolution filename evt_name\
+   evt_id=$1\
+   cam_nr=$2\
+   frame_time="$3"\
+   motion_session=$4\
+   file_sizeKB=$5\
+   resolution="$6x$7"\
+   filename="$8"\
+   evt_name="unknown"\
+   case $evt_id in\
+      15) evt_name="paranoid"   ;;\
+      16) evt_name="1st period" ;;\
+      17) evt_name="2nd period" ;;\
+   esac\
+   log debug "cam[$cam_nr]: save \"$evt_name\" jpeg snapshot \"$filename\" ($resolution, $file_sizeKB kB)"\
+   \
+   if [ $evt_id -eq 16 ]; then\
+       if [ -f "/etc/avreg/scripts/tg.sh" ]; then\
+           /etc/avreg/scripts/tg.sh send_file "$cam_nr" "$filename" "snapshot" &\
+           log debug "Telegram: отправка снимка камеры $cam_nr"\
+       else\
+           log debug "Telegram скрипт не найден"\
+       fi\
+   fi\
+}\
+' "$EVENT_COLLECTOR"
+        echo "✅ Добавлена функция on_snapshot_saved"
+    fi
+    
+    if grep -q "on_video_saved" "$EVENT_COLLECTOR"; then
+        sudo sed -i '/on_video_saved()/,/^}/ {
+            /log debug/ a\
+    \
+    if [ -n "$motion_session" ] && [ "$motion_session" -gt 0 ]; then\
+        if [ -f "/etc/avreg/scripts/tg.sh" ]; then\
+            /etc/avreg/scripts/tg.sh send_file "$cam_nr" "$filename" "video" &\
+            log debug "Telegram: отправка видео камеры $cam_nr"\
+        else\
+            log debug "Telegram скрипт не найден"\
+        fi\
+    fi
+        }' "$EVENT_COLLECTOR"
+        echo "✅ Добавлен вызов tg.sh в on_video_saved"
+    else
+        sudo sed -i '/^handle_event()/i \
+\
+on_video_saved() {\
+   local cam_nr last_frame_sec first_frame_sec\
+   local motion_session file_sizeKB frames_in_file resolution filename\
+   local sec_start sec_end diff_sec diff_min duration\
+\
+   cam_nr=$1\
+   last_frame_time="$2"\
+   first_frame_time="$3"\
+   motion_session=$4\
+   file_sizeKB=$5\
+   frames_in_file=$6\
+   resolution="$7x$8"\
+   filename="$9"\
+\
+   sec_start=$(date --date="$first_frame_time" +%s)\
+   sec_end=$(date --date="$last_frame_time" +%s)\
+   diff_sec=$(( $sec_end - $sec_start ))\
+   diff_min=$(( $diff_sec / 60 ))\
+   diff_sec=$(( $diff_sec % 60 ))\
+   duration=$(printf "%.2d:%.2d" $diff_min $diff_sec)\
+\
+   log debug "cam[$cam_nr]: save video \"$filename\" ($resolution, $duration, $file_sizeKB kB)"\
+   \
+   if [ -n "$motion_session" ] && [ "$motion_session" -gt 0 ]; then\
+       if [ -f "/etc/avreg/scripts/tg.sh" ]; then\
+           /etc/avreg/scripts/tg.sh send_file "$cam_nr" "$filename" "video" &\
+           log debug "Telegram: отправка видео камеры $cam_nr"\
+       else\
+           log debug "Telegram скрипт не найден"\
+       fi\
+   fi\
+}\
+' "$EVENT_COLLECTOR"
+        echo "✅ Добавлена функция on_video_saved"
+    fi
+    
+    if grep -q "tg.sh.*motion" "$EVENT_COLLECTOR"; then
+        sudo sed -i '/tg.sh.*motion/d' "$EVENT_COLLECTOR"
+        echo "✅ Удален старый вызов tg.sh из on_motion_session"
+    fi
+    
+    sudo chown "$AVREG_USER:$AVREG_GROUP" "$EVENT_COLLECTOR"
+    sudo chmod 0755 "$EVENT_COLLECTOR"
+    
+    echo "✅ Права доступа установлены: $AVREG_USER:$AVREG_GROUP, 0755"
+    
+    return 0
+}
+
+# Функция тестирования конфигурации
+test_configuration() {
+    echo "=== Тестирование конфигурации ==="
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "❌ Конфигурационный файл не найден"
+        return 1
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    echo "1. Проверка токена бота..."
+    
+    local curl_cmd="curl -s"
+    case $PROXY_TYPE in
+        "socks5")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT --socks5-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --socks5 $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+        "http")
+            if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT --proxy-user $PROXY_USER:$PROXY_PASS"
+            else
+                curl_cmd="$curl_cmd --proxy $PROXY_HOST:$PROXY_PORT"
+            fi
+            ;;
+    esac
+    
+    local bot_check=$($curl_cmd "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+    if echo "$bot_check" | grep -q '"ok":true'; then
+        local bot_name=$(echo "$bot_check" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
+        echo "   ✅ Бот: @${bot_name}"
+    else
+        echo "   ❌ Ошибка: $bot_check"
+        return 1
+    fi
+    
+    echo "2. Проверка настроек отправки сообщений..."
+    echo "   Отправлять текст: $SEND_TEXT"
+    echo "   Отправлять медиа: $SEND_MEDIA"
+    
+    echo "3. Проверка настроек расписания..."
+    echo "   Включено: $SCHEDULE_ENABLED"
+    echo "   Тип: $SCHEDULE_TYPE"
+    echo "   Дни: $SCHEDULE_DAYS"
+    echo "   Часы: $SCHEDULE_HOURS"
+    echo "   Минуты: $SCHEDULE_MINUTES"
+    echo "   Отправлять критические ошибки всегда: $SEND_CRITICAL_ALWAYS"
+    
+    echo "4. Проверка настроек событий..."
+    echo "   Типы событий: ${EVENT_TYPES[@]}"
+    echo "   Уровень логирования: $LOG_LEVEL"
+    
+    echo "5. Проверка камер в конфигурации..."
+    echo "   Настроено камер: $CAMERA_COUNT"
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        local send_text_display="общие"
+        local send_media_display="общие"
+        
+        if [ "${CAMERA_SEND_TEXT[$i]}" != "GENERAL" ]; then
+            send_text_display="${CAMERA_SEND_TEXT[$i]}"
+        fi
+        if [ "${CAMERA_SEND_MEDIA[$i]}" != "GENERAL" ]; then
+            send_media_display="${CAMERA_SEND_MEDIA[$i]}"
+        fi
+        
+        echo "   Камера ${CAMERA_NUMS[$i]}: Чат ${CAMERA_CHAT_IDS[$i]}, Тип: ${CAMERA_MEDIA_TYPES[$i]}, События: ${CAMERA_EVENT_TYPES[$i]}, Расписание: ${CAMERA_SCHEDULES[$i]}, Текст=$send_text_display, Медиа=$send_media_display"
+    done
+    
+    echo "6. Проверка доступности Avreg..."
+    if timeout 5 curl -s "http://${AVREG_URL}:874" > /dev/null; then
+        echo "   ✅ Avreg доступен"
+    else
+        echo "   ⚠️  Avreg недоступен по адресу: ${AVREG_URL}:874"
+    fi
+    
+    echo ""
+    if [ "$PROXY_TYPE" != "none" ]; then
+        echo "🌐 Используется прокси: $PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"
+        [ -n "$PROXY_USER" ] && echo "   С авторизацией: $PROXY_USER"
+    else
+        echo "🌐 Используется прямое соединение"
+    fi
+    
+    echo ""
+    echo "7. Тестирование камер..."
+    for ((i=0; i<CAMERA_COUNT; i++)); do
+        camera_num=${CAMERA_NUMS[$i]}
+        chat_id=${CAMERA_CHAT_IDS[$i]}
+        
+        if [ "$chat_id" != "ВАШ_CHAT_ID_ЗДЕСЬ" ] && [ "$chat_id" != "ОБЩИЙ_ЧАТ" ]; then
+            echo ""
+            echo "   Тестирование камеры $camera_num..."
+            sudo -u "$AVREG_USER" "$SCRIPT_FILE" test "$camera_num"
+        else
+            echo ""
+            echo "   ⚠️  Камера $camera_num: чат не настроен, пропускаем"
+        fi
+    done
+    
+    echo ""
+    echo "=== Результаты тестирования ==="
+    echo "Логи находятся в: /tmp/telegram_bot.log"
+    echo "Для просмотра лога выполните: tail -f /tmp/telegram_bot.log"
+}
+
+# Функция проверки зависимостей
+check_dependencies() {
+    echo "Проверка зависимостей..."
+    
+    local missing=0
+    
+    if ! command -v wget &> /dev/null; then
+        echo "❌ wget не установлен"
+        missing=1
+    else
+        echo "✅ wget установлен"
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        echo "❌ curl не установлен"
+        missing=1
+    else
+        echo "✅ curl установлен"
+    fi
+    
+    if ! command -v base64 &> /dev/null; then
+        echo "❌ base64 не установлен"
+        missing=1
+    else
+        echo "✅ base64 установлен"
+    fi
+    
+    if ! command -v gunzip &> /dev/null; then
+        echo "❌ gunzip не установлен"
+        missing=1
+    else
+        echo "✅ gunzip установлен"
+    fi
+    
+    if ! command -v ffmpeg &> /dev/null; then
+        echo "⚠️  ffmpeg не установлен (рекомендуется для работы с видео)"
+    else
+        echo "✅ ffmpeg установлен"
+    fi
+    
+    if ! id "$AVREG_USER" &>/dev/null; then
+        echo "⚠️  Пользователь $AVREG_USER не существует."
+        read -p "Использовать пользователя по умолчанию (avreg)? (y/n): " use_default
+        if [[ ! $use_default =~ ^[Yy]$ ]]; then
+            read -p "Введите имя пользователя: " AVREG_USER
+            if ! id "$AVREG_USER" &>/dev/null; then
+                echo "❌ Пользователь $AVREG_USER не существует"
+                return 1
+            fi
+        else
+            echo "⚠️  Создайте пользователя avreg: sudo useradd -r -s /bin/false avreg"
+        fi
+    else
+        echo "✅ Пользователь $AVREG_USER существует"
+    fi
+    
+    if [ $missing -eq 1 ]; then
+        echo ""
+        echo "Установите недостающие пакеты:"
+        echo "Debian/Ubuntu: sudo apt-get install wget curl coreutils gzip"
+        echo "CentOS/RHEL: sudo yum install wget curl coreutils gzip"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Функция настройки прав доступа
+setup_permissions() {
+    echo "=== Настройка прав доступа для всех файлов ==="
+    
+    if [ -f "$SCRIPT_FILE" ]; then
+        sudo chown "$AVREG_USER:$AVREG_GROUP" "$SCRIPT_FILE"
+        sudo chmod 0755 "$SCRIPT_FILE"
+        echo "✅ Права для $SCRIPT_FILE: $AVREG_USER:$AVREG_GROUP, 0755"
+    fi
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        sudo chown "$AVREG_USER:$AVREG_GROUP" "$CONFIG_FILE"
+        sudo chmod 0640 "$CONFIG_FILE"
+        echo "✅ Права для $CONFIG_FILE: $AVREG_USER:$AVREG_GROUP, 0640"
+    fi
+    
+    if [ -f "$CONFIG_EDITOR" ]; then
+        sudo chown "$AVREG_USER:$AVREG_GROUP" "$CONFIG_EDITOR"
+        sudo chmod 0755 "$CONFIG_EDITOR"
+        echo "✅ Права для $CONFIG_EDITOR: $AVREG_USER:$AVREG_GROUP, 0755"
+    fi
+    
+    if [ -f "$EVENT_COLLECTOR" ]; then
+        sudo chown "$AVREG_USER:$AVREG_GROUP" "$EVENT_COLLECTOR"
+        sudo chmod 0755 "$EVENT_COLLECTOR"
+        echo "✅ Права для $EVENT_COLLECTOR: $AVREG_USER:$AVREG_GROUP, 0755"
+    fi
+    
+    sudo mkdir -p /etc/avreg/scripts
+    sudo chown "$AVREG_USER:$AVREG_GROUP" /etc/avreg/scripts
+    sudo chmod 0755 /etc/avreg/scripts
+    
+    sudo mkdir -p /etc/avreg/scripts/backups
+    sudo chown "$AVREG_USER:$AVREG_GROUP" /etc/avreg/scripts/backups
+    sudo chmod 0755 /etc/avreg/scripts/backups
+    
+    echo "=== Проверка прав доступа ==="
+    ls -la /etc/avreg/scripts/ 2>/dev/null || echo "Директория /etc/avreg/scripts/ не существует"
+}
+
+# Функция проверки и исправления event-collector
+fix_event_collector() {
+    echo "=== Проверка и исправление event-collector ==="
+    
+    if [ ! -f "$EVENT_COLLECTOR" ]; then
+        echo "❌ event-collector не найден. Сначала выполните пункт 3."
+        return 1
+    fi
+    
+    local has_snapshot=$(grep -c "tg.sh.*send_file.*snapshot" "$EVENT_COLLECTOR")
+    local has_video=$(grep -c "tg.sh.*send_file.*video" "$EVENT_COLLECTOR")
+    local has_old_motion=$(grep -c "tg.sh.*motion" "$EVENT_COLLECTOR")
+    
+    echo "Текущее состояние event-collector:"
+    echo "  Вызовы для снимков: $has_snapshot"
+    echo "  Вызовы для видео: $has_video"
+    echo "  Старые вызовы из motion: $has_old_motion"
+    
+    if [ $has_snapshot -eq 0 ] || [ $has_video -eq 0 ]; then
+        echo ""
+        echo "⚠️  Обнаружены проблемы. Хотите переустановить event-collector?"
+        read -p "Переустановить? (y/n): " reinstall
+        if [[ $reinstall =~ ^[Yy]$ ]]; then
+            setup_event_collector
+        fi
+    else
+        echo "✅ event-collector настроен правильно"
+    fi
+}
+
+# Главное меню
+show_main_menu() {
+    while true; do
+        echo ""
+        echo "=== Меню управления Telegram уведомлениями Avreg v1.7 ==="
+        echo "1) Настроить конфигурацию (обязательно сначала)"
+        echo "2) Протестировать конфигурацию"
+        echo "3) Настроить event-collector (копирование и модификация)"
+        echo "4) Проверить и исправить event-collector"
+        echo "5) Настроить права доступа для всех файлов"
+        echo "6) Показать текущую конфигурацию"
+        echo "7) Проверить состояние системы"
+        echo "8) Просмотреть логи"
+        echo "9) Перезапустить avreg"
+        echo "10) Проверить/установить ffmpeg"
+        echo "11) Запустить редактор конфигурации"
+        echo "12) Выход"
+        echo ""
+        
+        read -p "Выберите действие (1-12): " choice
+        
+        case $choice in
+            1)
+                request_config
+                create_script
+                create_config_editor
+                setup_permissions
+                echo ""
+                echo "⚠️  ВАЖНО: Теперь необходимо настроить event-collector (пункт 3)"
+                ;;
+            2)
+                test_configuration
+                ;;
+            3)
+                setup_event_collector
+                setup_permissions
+                echo ""
+                echo "✅ event-collector настроен. Перезапустите avreg (пункт 9)"
+                ;;
+            4)
+                fix_event_collector
+                ;;
+            5)
+                setup_permissions
+                ;;
+            6)
+                view_config
+                ;;
+            7)
+                echo "=== Состояние системы ==="
+                check_dependencies
+                echo ""
+                if [ -f "$CONFIG_FILE" ]; then
+                    source "$CONFIG_FILE" 2>/dev/null
+                    echo "Конфигурация загружена: Да"
+                    echo "Токен бота: $(echo ${BOT_TOKEN:0:10})..."
+                    echo "Типы событий: ${EVENT_TYPES[@]}"
+                    echo "Уровень логирования: $LOG_LEVEL"
+                    echo "Отправка текста: $SEND_TEXT"
+                    echo "Отправка медиа: $SEND_MEDIA"
+                    echo "Настройки расписания: $SCHEDULE_ENABLED, $SCHEDULE_TYPE"
+                    echo "Количество камер: $CAMERA_COUNT"
+                    echo "Пользователь скриптов: $AVREG_USER"
+                    if [ "$PROXY_TYPE" != "none" ]; then
+                        echo "🌐 Прокси: $PROXY_TYPE://$PROXY_HOST:$PROXY_PORT"
+                    fi
+                else
+                    echo "Конфигурация загружена: Нет"
+                fi
+                echo ""
+                echo "Скрипты:"
+                ls -la /etc/avreg/scripts/ 2>/dev/null || echo "Директория /etc/avreg/scripts/ не существует"
+                echo ""
+                echo "Проверка службы avreg:"
+                if command -v systemctl &> /dev/null; then
+                    systemctl status avreg --no-pager | head -10
+                elif command -v service &> /dev/null; then
+                    service avreg status | head -10
+                else
+                    echo "Не удалось проверить состояние службы"
+                fi
+                ;;
+            8)
+                echo "=== Логи ==="
+                if [ -f "/tmp/telegram_bot.log" ]; then
+                    echo "Последние 20 строк лога Telegram бота:"
+                    tail -20 "/tmp/telegram_bot.log"
+                    echo ""
+                    echo "Полный лог: tail -f /tmp/telegram_bot.log"
+                else
+                    echo "Лог файл Telegram бота не найден"
+                fi
+                
+                echo ""
+                echo "Логи avreg:"
+                if [ -f "/var/log/avreg/avreg.log" ]; then
+                    echo "Последние 10 строк лога avreg:"
+                    tail -10 "/var/log/avreg/avreg.log"
+                else
+                    echo "Лог avreg не найден"
+                fi
+                
+                echo ""
+                echo "Логи event-collector:"
+                if [ -f "/var/log/avreg/evtcoll.log" ]; then
+                    echo "Последние 10 строк лога event-collector:"
+                    tail -10 "/var/log/avreg/evtcoll.log"
+                elif [ -f "/var/log/avreg/evtcoll-avreg.log" ]; then
+                    echo "Последние 10 строк лога event-collector:"
+                    tail -10 "/var/log/avreg/evtcoll-avreg.log"
+                else
+                    echo "Лог event-collector не найден"
+                fi
+                ;;
+            9)
+                echo "Перезапуск avreg..."
+                if command -v systemctl &> /dev/null; then
+                    sudo systemctl restart avreg
+                    echo "✅ systemctl: avreg перезапущен"
+                elif command -v service &> /dev/null; then
+                    sudo service avreg restart
+                    echo "✅ service: avreg перезапущен"
+                else
+                    echo "⚠️  Не удалось определить способ управления службами"
+                fi
+                ;;
+            10)
+                check_and_install_ffmpeg
+                ;;
+            11)
+                if [ -f "$CONFIG_EDITOR" ]; then
+                    sudo -u "$AVREG_USER" "$CONFIG_EDITOR"
+                else
+                    echo "❌ Редактор конфигурации не найден"
+                    echo "Сначала выполните пункт 1 для настройки"
+                fi
+                ;;
+            12)
+                echo "Выход"
+                exit 0
+                ;;
+            *)
+                echo "❌ Неверный выбор"
+                ;;
+        esac
+    done
+}
+
+# ==================== ЗАПУСК ====================
+
+sudo mkdir -p /etc/avreg/scripts
+
+if [ "$EUID" -ne 0 ]; then 
+    echo "⚠️  Рекомендуется запускать скрипт с правами root (sudo)"
+    read -p "Продолжить? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+echo "=== Установка Telegram уведомлений для Avreg ==="
+echo "Версия 1.7"
+echo "✓ Поддержка прокси (SOCKS5, HTTP/HTTPS, MTProto)"
+echo "✓ Поддержка расписания работы бота"
+echo "✓ Гибкая настройка отправки текста/медиа"
+echo "✓ Отправка уже сохраненных файлов из архива Avreg"
+echo ""
+
+if ! command -v ffmpeg &> /dev/null; then
+    echo "⚠️  ВНИМАНИЕ: ffmpeg не установлен."
+    echo "   Для правильной работы с видео рекомендуется установить ffmpeg."
+    echo "   Вы можете установить его через пункт меню 10."
+    echo ""
+fi
+
+check_dependencies
+if [ $? -eq 0 ]; then
+    show_main_menu
+else
+    echo "❌ Установите зависимости и запустите скрипт снова"
+    exit 1
+fi
